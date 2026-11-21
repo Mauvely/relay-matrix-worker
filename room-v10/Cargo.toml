@@ -1,0 +1,19 @@
+[package]
+name = "relay-room-v10"
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-or-later"
+[lib]
+crate-type = ["cdylib"]
+[dependencies]
+ruma-state-res = "0.19"
+ruma-common = { version = "0.21", features = ["js"] }
+ruma-events = "0.36"
+ruma-signatures = "0.23"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["raw_value"] }
+wasm-bindgen = "0.2"
+getrandom = { version = "0.4", features = ["wasm_js"] }
+[profile.release]
+opt-level = "s"
+lto = true

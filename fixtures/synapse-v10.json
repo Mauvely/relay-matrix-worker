@@ -1,0 +1,323 @@
+{
+  "pdus": [
+    {
+      "signatures": {
+        "synapse.matrix.test": {
+          "ed25519:a_wEik": "ivlFampasSPX0c4kEoyqVpWdStDQYqbFubzuBwoABrA/zoNrJZV87plMLcGkw4/V9sPUa6/nAba4ZOCh2MXiCg"
+        }
+      },
+      "room_id": "!qIocSATidCXNPIbTik:synapse.matrix.test",
+      "auth_events": [],
+      "prev_events": [],
+      "content": {
+        "creator": "@alice00176b11:synapse.matrix.test",
+        "room_version": "10"
+      },
+      "depth": 1,
+      "hashes": {
+        "sha256": "G4y9lfrlGWoIq9x+9s4yuLpsehFxy5DNEv0QnDte43g"
+      },
+      "origin_server_ts": 1795276531206,
+      "sender": "@alice00176b11:synapse.matrix.test",
+      "state_key": "",
+      "type": "m.room.create"
+    },
+    {
+      "signatures": {
+        "synapse.matrix.test": {
+          "ed25519:a_wEik": "7T86nKtE83SqPxl6IBK7eO66cF+Euu14RVFaTiK8EERU9H/Gmx25FlB4dHnxYH0ZOg/5oINzySH3XAxpksFtAA"
+        }
+      },
+      "room_id": "!qIocSATidCXNPIbTik:synapse.matrix.test",
+      "auth_events": [
+        "$Zflhc8w_7chWeYUDXbcKVYDN0AyGxYszqgBepAVJeVI"
+      ],
+      "prev_events": [
+        "$Zflhc8w_7chWeYUDXbcKVYDN0AyGxYszqgBepAVJeVI"
+      ],
+      "content": {
+        "displayname": "alice00176b11",
+        "membership": "join"
+      },
+      "depth": 2,
+      "hashes": {
+        "sha256": "RqG/QcRYUlmcz6NsyQG7a9CJd8XEujMQvhe2sTPW3bQ"
+      },
+      "origin_server_ts": 1795276531245,
+      "sender": "@alice00176b11:synapse.matrix.test",
+      "state_key": "@alice00176b11:synapse.matrix.test",
+      "type": "m.room.member"
+    },
+    {
+      "signatures": {
+        "synapse.matrix.test": {
+          "ed25519:a_wEik": "YsaadO6MI9ivf8kUVcdUdF0spuHuaMkhTd8o9hDSo0hDw1kHWlG+HPv98tCCOAEKsYZsZ8KHXsPSR9FpxlNqBw"
+        }
+      },
+      "room_id": "!qIocSATidCXNPIbTik:synapse.matrix.test",
+      "auth_events": [
+        "$-ucfpm6opWT8HTg2xKm74dtI1sMYIvppUaju372s-yk",
+        "$Zflhc8w_7chWeYUDXbcKVYDN0AyGxYszqgBepAVJeVI"
+      ],
+      "prev_events": [
+        "$-ucfpm6opWT8HTg2xKm74dtI1sMYIvppUaju372s-yk"
+      ],
+      "content": {
+        "ban": 50,
+        "events": {
+          "m.room.avatar": 50,
+          "m.room.canonical_alias": 50,
+          "m.room.encryption": 100,
+          "m.room.history_visibility": 100,
+          "m.room.name": 50,
+          "m.room.power_levels": 100,
+          "m.room.server_acl": 100,
+          "m.room.tombstone": 100
+        },
+        "events_default": 0,
+        "historical": 100,
+        "invite": 0,
+        "kick": 50,
+        "redact": 50,
+        "state_default": 50,
+        "users": {
+          "@alice00176b11:synapse.matrix.test": 100
+        },
+        "users_default": 0
+      },
+      "depth": 3,
+      "hashes": {
+        "sha256": "WU7RBWTEqVSfxahAZnxPMpGBQ5QgAmHnwrmRLtZT7z4"
+      },
+      "origin_server_ts": 1795276531276,
+      "sender": "@alice00176b11:synapse.matrix.test",
+      "state_key": "",
+      "type": "m.room.power_levels"
+    },
+    {
+      "signatures": {
+        "synapse.matrix.test": {
+          "ed25519:a_wEik": "jIqas0v7/ebWfza74Np2YP/REAdcmnxKpFJmB9VsVudh3fE3BenOhk/DMSk86sY5v1qu50NoZz0rkMn8gDQTBQ"
+        }
+      },
+      "room_id": "!qIocSATidCXNPIbTik:synapse.matrix.test",
+      "auth_events": [
+        "$-ucfpm6opWT8HTg2xKm74dtI1sMYIvppUaju372s-yk",
+        "$o5c6C51ySJxZ2PktYAvPjwDiiDbynTc6_SKZSBQ3NI0",
+        "$Zflhc8w_7chWeYUDXbcKVYDN0AyGxYszqgBepAVJeVI"
+      ],
+      "prev_events": [
+        "$o5c6C51ySJxZ2PktYAvPjwDiiDbynTc6_SKZSBQ3NI0"
+      ],
+      "content": {
+        "guest_access": "can_join"
+      },
+      "depth": 4,
+      "hashes": {
+        "sha256": "hPR+Bdym6wzeAtWDVIK+rtuxee/+8Tp/BBHyEbCmsjE"
+      },
+      "origin_server_ts": 1795276531284,
+      "sender": "@alice00176b11:synapse.matrix.test",
+      "state_key": "",
+      "type": "m.room.guest_access"
+    },
+    {
+      "signatures": {
+        "synapse.matrix.test": {
+          "ed25519:a_wEik": "gzpsbElGG0+ObG2AnUcjHQ8kw6VN50Oq85LLbxLze7vI5ovFxcrvYTIDxrbyF3v4DyjKr1eBTEgxuJXzUVLyCQ"
+        }
+      },
+      "room_id": "!qIocSATidCXNPIbTik:synapse.matrix.test",
+      "auth_events": [
+        "$-ucfpm6opWT8HTg2xKm74dtI1sMYIvppUaju372s-yk",
+        "$o5c6C51ySJxZ2PktYAvPjwDiiDbynTc6_SKZSBQ3NI0",
+        "$Zflhc8w_7chWeYUDXbcKVYDN0AyGxYszqgBepAVJeVI"
+      ],
+      "prev_events": [
+        "$1pGwABw6C2Izqit9f4WOQD11kFtxV2jfjI-cBvHwgOI"
+      ],
+      "content": {
+        "join_rule": "invite"
+      },
+      "depth": 5,
+      "hashes": {
+        "sha256": "hEifOa0bWw9wd5BrfVg4h1UR3RrIxBN4WAfZ6/fm7WY"
+      },
+      "origin_server_ts": 1795276531288,
+      "sender": "@alice00176b11:synapse.matrix.test",
+      "state_key": "",
+      "type": "m.room.join_rules"
+    },
+    {
+      "signatures": {
+        "synapse.matrix.test": {
+          "ed25519:a_wEik": "ez5+90Fq/AK63Y29dg5Sp3n9ZUDX2GteST5+EVXEHNGmRnfUPn8bQjz5t2Lf9YoMncK8/Dn+TEJYGWJbtZvFBg"
+        }
+      },
+      "room_id": "!qIocSATidCXNPIbTik:synapse.matrix.test",
+      "auth_events": [
+        "$-ucfpm6opWT8HTg2xKm74dtI1sMYIvppUaju372s-yk",
+        "$o5c6C51ySJxZ2PktYAvPjwDiiDbynTc6_SKZSBQ3NI0",
+        "$Zflhc8w_7chWeYUDXbcKVYDN0AyGxYszqgBepAVJeVI"
+      ],
+      "prev_events": [
+        "$GaK7jo85uYmAy-fGnazV2YiGnrAAIIY078BF-otS6dE"
+      ],
+      "content": {
+        "history_visibility": "joined"
+      },
+      "depth": 6,
+      "hashes": {
+        "sha256": "/lSLJy2+qfFr3LKvhcJwg3yj8EHYrEGsBHv4rk3xavs"
+      },
+      "origin_server_ts": 1795276531291,
+      "sender": "@alice00176b11:synapse.matrix.test",
+      "state_key": "",
+      "type": "m.room.history_visibility"
+    },
+    {
+      "signatures": {
+        "synapse.matrix.test": {
+          "ed25519:a_wEik": "j4PvRuuHkUl2aVBasMo83mfMRFKEPAP1VChYfBitLH389CTiBx8xZGyTcDN6SQH7MZgzux5MtaQNHSEspYG7BA"
+        }
+      },
+      "room_id": "!qIocSATidCXNPIbTik:synapse.matrix.test",
+      "auth_events": [
+        "$GaK7jo85uYmAy-fGnazV2YiGnrAAIIY078BF-otS6dE",
+        "$Zflhc8w_7chWeYUDXbcKVYDN0AyGxYszqgBepAVJeVI",
+        "$o5c6C51ySJxZ2PktYAvPjwDiiDbynTc6_SKZSBQ3NI0",
+        "$-ucfpm6opWT8HTg2xKm74dtI1sMYIvppUaju372s-yk"
+      ],
+      "prev_events": [
+        "$EvhhpsyVNIu1XQKyf_9KN_3dnVhpPaaOMWMEQN54OZE"
+      ],
+      "content": {
+        "displayname": "bob00176b11",
+        "membership": "invite"
+      },
+      "depth": 7,
+      "hashes": {
+        "sha256": "6URD0OQ9MW0bO7YgmfbopFCXdbnochHEDobDGyaJiVs"
+      },
+      "origin_server_ts": 1795276531327,
+      "sender": "@alice00176b11:synapse.matrix.test",
+      "state_key": "@bob00176b11:synapse.matrix.test",
+      "type": "m.room.member"
+    },
+    {
+      "signatures": {
+        "synapse.matrix.test": {
+          "ed25519:a_wEik": "3zVufFJJ6HjDR29k8FgbvYsWHkrsPA9pg0Z6SjBZiKL6g6Kg5FuZxONN0vSI3aQFn30725ag18KGqz+rW1O/Bw"
+        }
+      },
+      "room_id": "!qIocSATidCXNPIbTik:synapse.matrix.test",
+      "auth_events": [
+        "$GaK7jo85uYmAy-fGnazV2YiGnrAAIIY078BF-otS6dE",
+        "$o5c6C51ySJxZ2PktYAvPjwDiiDbynTc6_SKZSBQ3NI0",
+        "$OuaYt_Nk1oRihOA97GPzHMmi7x4Iyh60NhN7gVWHHp0",
+        "$Zflhc8w_7chWeYUDXbcKVYDN0AyGxYszqgBepAVJeVI"
+      ],
+      "prev_events": [
+        "$OuaYt_Nk1oRihOA97GPzHMmi7x4Iyh60NhN7gVWHHp0"
+      ],
+      "content": {
+        "displayname": "bob00176b11",
+        "membership": "join"
+      },
+      "depth": 8,
+      "hashes": {
+        "sha256": "WhSG9tYQJrdUCyOIaCQg8p97Vn/BdSwmpPUNYOtUSuc"
+      },
+      "origin_server_ts": 1795276531369,
+      "sender": "@bob00176b11:synapse.matrix.test",
+      "state_key": "@bob00176b11:synapse.matrix.test",
+      "type": "m.room.member"
+    },
+    {
+      "signatures": {
+        "synapse.matrix.test": {
+          "ed25519:a_wEik": "DwFYvHDeUwdXD4PNPCYulBHgt6X/1PuCna1y9vqglLv3xtD9XjC7Z2we5VsEIMCTKjRL3amXo2M6btBYuvlGBQ"
+        }
+      },
+      "room_id": "!qIocSATidCXNPIbTik:synapse.matrix.test",
+      "auth_events": [
+        "$-ucfpm6opWT8HTg2xKm74dtI1sMYIvppUaju372s-yk",
+        "$o5c6C51ySJxZ2PktYAvPjwDiiDbynTc6_SKZSBQ3NI0",
+        "$Zflhc8w_7chWeYUDXbcKVYDN0AyGxYszqgBepAVJeVI"
+      ],
+      "prev_events": [
+        "$-B7FdrZX0BEqAuvij7G8cuNqSC0l6HLwBDE_WCLYj4U"
+      ],
+      "content": {
+        "body": "fixture",
+        "msgtype": "m.text"
+      },
+      "depth": 9,
+      "hashes": {
+        "sha256": "jo/gNMl9velg6JWiBcduDFTq2QfYY0y00ptdkJxr4O8"
+      },
+      "origin_server_ts": 1795276531405,
+      "sender": "@alice00176b11:synapse.matrix.test",
+      "type": "m.room.message"
+    }
+  ],
+  "forks": [
+    {
+      "type": "m.room.topic",
+      "state_key": "",
+      "sender": "@alice00176b11:synapse.matrix.test",
+      "room_id": "!qIocSATidCXNPIbTik:synapse.matrix.test",
+      "content": {
+        "topic": "Morning"
+      },
+      "origin_server_ts": 1795276531406,
+      "origin": "synapse.matrix.test",
+      "prev_events": [
+        "$M-bFf8As4Pg0pVdZ2fEp914jJ6Y6hCCXuB_TB7kndHk"
+      ],
+      "auth_events": [
+        "$Zflhc8w_7chWeYUDXbcKVYDN0AyGxYszqgBepAVJeVI",
+        "$o5c6C51ySJxZ2PktYAvPjwDiiDbynTc6_SKZSBQ3NI0",
+        "$-ucfpm6opWT8HTg2xKm74dtI1sMYIvppUaju372s-yk"
+      ],
+      "depth": 10,
+      "hashes": {
+        "sha256": "DtFDbSWcCVhLB9SL1T//rKBhtI6beQCknRLQ8JUy0Oo"
+      },
+      "signatures": {
+        "synapse.matrix.test": {
+          "ed25519:a_wEik": "4ot239lVKjh/u+uSDDjo8Lajem1IKAkKUBjuS/vB3PumfoiVIiZnk4lO+8r6dMpGvh6bQGgQpHF3+rZ8g9MZDQ"
+        }
+      }
+    },
+    {
+      "type": "m.room.topic",
+      "state_key": "",
+      "sender": "@alice00176b11:synapse.matrix.test",
+      "room_id": "!qIocSATidCXNPIbTik:synapse.matrix.test",
+      "content": {
+        "topic": "Afternoon"
+      },
+      "origin_server_ts": 1795276531407,
+      "origin": "synapse.matrix.test",
+      "prev_events": [
+        "$M-bFf8As4Pg0pVdZ2fEp914jJ6Y6hCCXuB_TB7kndHk"
+      ],
+      "auth_events": [
+        "$Zflhc8w_7chWeYUDXbcKVYDN0AyGxYszqgBepAVJeVI",
+        "$o5c6C51ySJxZ2PktYAvPjwDiiDbynTc6_SKZSBQ3NI0",
+        "$-ucfpm6opWT8HTg2xKm74dtI1sMYIvppUaju372s-yk"
+      ],
+      "depth": 10,
+      "hashes": {
+        "sha256": "6q2QC3CjiGAQDePTcbyzOTS0378L4glAeUoIgn6jPqM"
+      },
+      "signatures": {
+        "synapse.matrix.test": {
+          "ed25519:a_wEik": "FTXtenforWlW+eQIrg5G3jSIHoQjIHYsk/JjCbhhoZmAjCz9Oru5zlEJ2/VsFuVRIK1a+O9TqRBFRhXGXdCSBg"
+        }
+      }
+    }
+  ],
+  "winner": "$g36nKjtAH2BFd9B5KZbrJweGYkhW1N7qQOEF4qpNRKQ"
+}

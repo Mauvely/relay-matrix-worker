@@ -1,0 +1,14 @@
+{
+  "name": "relay-matrix-worker",
+  "version": "1.0.0",
+  "scripts": {
+    "test": "node --test",
+    "build": "./build-room.sh"
+  },
+  "license": "AGPL-3.0-or-later",
+  "type": "module",
+  "devDependencies": {
+    "wrangler": "4.124.0"
+  },
+  "description": "Workers-native Matrix interoperability spike"
+}
