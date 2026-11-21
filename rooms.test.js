@@ -218,3 +218,11 @@ test('Matrix TURN credentials are scoped to the authenticated account and reused
   home.party = async () => ({organisationId:'restricted'});
   await assert.rejects(get('@a:worker.test'),e=>e.status===403);
 });
+
+test('public room joins use via hints, legacy hints and the room ID domain in order', async () => {
+  const {joinServers} = await import('./src/invites.js');
+  const hints = new URLSearchParams('via=local.test&via=resident.test&server_name=second.test&via=resident.test');
+  assert.deepEqual(joinServers('!id:creator.test:8448',hints,'local.test'), ['resident.test','second.test','creator.test:8448']);
+  assert.deepEqual(joinServers('!id:local.test',new URLSearchParams(),'local.test'), []);
+  assert.deepEqual(joinServers('#alias:creator.test',hints,'local.test'), []);
+});

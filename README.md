@@ -44,6 +44,8 @@ Linear room appends validate against committed room state. A deployed Worker acc
 
 An independent stock Synapse rotated its signing key while sharing a v11 room with the Worker. Its new key authenticated federation requests and messages on the first send after restart. The Worker retained the pre-rotation event and delivered a reply in the same room. Discovered keys carry event-time validity, including the retirement time for old keys. Only active keys authenticate HTTP requests.
 
+An open account can use `POST /join/{roomIdOrAlias}` with a remote alias or a room ID and routing hints. Public joins verify the resident server, signed state, auth chain, join rules and server ACL before committing. A stock v11 room with 520 messages and joined-only history accepted two concurrent requests as one membership. A private room without an invitation refused the same client.
+
 SRV-based discovery, large membership and auth snapshots, restricted-room admission and broader Complement coverage remain cutover work.
 
 Stock Synapse and the Worker created version 11 rooms in both directions, admitted the invitee, and exchanged messages and replies. Both v10 and v11 joined-history tests passed with 520 prior Synapse messages. The Worker exposed only the new membership, then delivered the next message. Unit tests replay two signed forks from a join anchor in opposite orders and reject incomplete or wrongly signed state.

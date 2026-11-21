@@ -2,7 +2,7 @@
 import { deliver, syncDevices } from './device.js';
 import module from '../room-v10/pkg/relay_room_v10_bg.wasm';
 import { initSync } from '../room-v10/pkg/relay_room_v10.js';
-import { inviteSchema, joinRemote, remoteInvites } from './invites.js';
+import { inviteSchema, joinRemote, joinServers, lookupAlias, remoteInvites } from './invites.js';
 import { backupSchema } from './backup.js';
 import { announceJoinedDevices, keySchema, keyCounts, sharedUsers } from './keys.js';
 import { clientApi, federationApi } from './api.js';
@@ -103,6 +103,19 @@ export class Homeserver extends DurableObject {
   async api(server, auth, peer, method, parts, query, body) {
     const joining =
       !peer && method === 'POST' && (parts[0] === 'join' || (parts[0] === 'rooms' && parts[2] === 'join'));
+    const lookup = !peer && method === 'GET' && parts.length === 3 && parts[0] === 'directory' && parts[1] === 'room';
+    if (lookup || (joining && parts[1]?.startsWith('#'))) {
+      try {
+        const target = await lookupAlias(this, server, auth.user_id, parts[lookup ? 2 : 1]);
+        if (lookup) return {status: 200, body: target};
+        parts[1] = target.room_id;
+        const routes = new URLSearchParams(query);
+        for (const via of target.servers) routes.append('via', via);
+        query = routes.toString();
+      } catch (error) {
+        return {status: error.status ?? 502, body: {errcode: error.errcode ?? 'M_UNKNOWN', error: error.message}};
+      }
+    }
     const invite =
       joining &&
       this.sql
@@ -112,6 +125,10 @@ export class Homeserver extends DurableObject {
           parts[1]
         )
         .toArray()[0];
+    const params = new URLSearchParams(query);
+    const candidates = joining && !invite &&
+      !this.sql.exec('SELECT 1 FROM room_tips WHERE room=? LIMIT 1', parts[1]).toArray().length
+      ? joinServers(parts[1], params, server) : [];
     const gaps = new Map();
     if (peer && parts[0] === 'send' && method === 'PUT' && body.origin === peer &&
         Array.isArray(body.pdus) && body.pdus.length <= 50 && (body.edus?.length ?? 0) <= 100 &&
@@ -127,8 +144,8 @@ export class Homeserver extends DurableObject {
     }
     const run = async () => {
       try {
-        if (invite) return await joinRemote(this, server, auth.user_id, parts[1], invite);
-        const args = [this, server, peer || auth, method, parts, new URLSearchParams(query), body];
+        if (invite || candidates.length) return await joinRemote(this, server, auth.user_id, parts[1], invite, candidates);
+        const args = [this, server, peer || auth, method, parts, params, body];
         return peer ? await federationApi(...args,gaps) : await clientApi(...args);
       } catch (e) {
         return {
@@ -142,7 +159,7 @@ export class Homeserver extends DurableObject {
     };
     // Peers may call back for our signing key while answering a join or key query.
     const callsPeer =
-      invite ||
+      invite || candidates.length ||
       (!peer && parts[0] === 'profile') ||
       (!peer && parts[0] === 'keys' && ['claim', 'query'].includes(parts[1]));
     const result = callsPeer ? await run() : await this.ctx.blockConcurrencyWhile(run);

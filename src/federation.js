@@ -74,6 +74,7 @@ export async function remote(home, origin, destination, method, uri, content) {
     },
     body: content === undefined ? undefined : JSON.stringify(content)
   });
-  if (!response.ok) throw Error('Federation returned HTTP ' + response.status);
+  if (!response.ok)
+    throw Object.assign(Error('Federation returned HTTP ' + response.status), { federationStatus: response.status });
   return response;
 }

@@ -12,6 +12,7 @@ export function inviteSchema(sql) {
   sql.exec(
     'CREATE TABLE IF NOT EXISTS remote_invites(seq INTEGER PRIMARY KEY AUTOINCREMENT,user TEXT,room TEXT,peer TEXT,signed TEXT,stripped TEXT,joining TEXT,UNIQUE(user,room))'
   );
+  sql.exec('CREATE TABLE IF NOT EXISTS public_joins(user TEXT, room TEXT, peer TEXT NOT NULL, version INTEGER NOT NULL, joining TEXT NOT NULL, PRIMARY KEY(user,room))');
   if (!sql.exec('PRAGMA table_info(remote_invites)').toArray().some((col) => col.name === 'version'))
     sql.exec('ALTER TABLE remote_invites ADD COLUMN version INTEGER NOT NULL DEFAULT 10');
 }
@@ -90,66 +91,104 @@ export function remoteInvites(home, user, cursor, initial) {
     rooms: Object.fromEntries(rows.map((r) => [r.room, { invite_state: { events: JSON.parse(r.stripped) } }]))
   };
 }
-export async function joinRemote(home, server, user, room, invite) {
+export async function lookupAlias(home, server, user, alias) {
   await openParty(home, server, user);
-  const version = invite.version ?? 10;
-  const peer = invite.peer,
-    prefix = '/_matrix/federation/',
-    rid = encodeURIComponent(room);
-  const request = async (method, path, content) => {
-    const response = await remote(home, server, peer, method, prefix + path, content);
-    return JSON.parse(new TextDecoder().decode(await limited(response.body, 4 * 1024 * 1024)));
-  };
-  // Save the exact signed join before the first remote write; retries use the same signed event ID.
-  let join = invite.joining && JSON.parse(invite.joining);
-  if (!join) {
-    const template = await request('GET', 'v1/make_join/' + rid + '/' + encodeURIComponent(user) + '?ver=10&ver=11');
-    if (template.room_version !== String(version)) fail(400, 'M_INCOMPATIBLE_ROOM_VERSION', 'Room version differs from the signed invitation');
-    const p = template.event;
-    if (
-      p.room_id !== room ||
-      p.sender !== user ||
-      p.type !== 'm.room.member' ||
-      p.state_key !== user ||
-      p.content?.membership !== 'join'
-    )
-      fail(502, 'M_BAD_JSON', 'Invalid join template');
-    const proposal = {
-      room_id: room,
-      sender: user,
-      state_key: user,
-      type: p.type,
-      content: { membership: 'join', ...await home.profile?.(user,server) },
-      origin: server,
-      origin_server_ts: Date.now(),
-      depth: p.depth,
-      prev_events: p.prev_events,
-      auth_events: p.auth_events
-    };
-    join = await signPdu(home.identity, server, proposal,version);
-    home.sql.exec(
-      'UPDATE remote_invites SET joining=COALESCE(joining,?) WHERE user=? AND room=? AND signed=?',
-      JSON.stringify(join),
-      user,
-      room,
-      invite.signed
-    );
-    const winner = home.sql
-      .exec(
-        'SELECT joining FROM remote_invites WHERE user=? AND room=? AND signed=?',
-        user,
-        room,
-        invite.signed
-      )
-      .toArray()[0];
-    if (!winner?.joining) fail(409, 'M_UNKNOWN', 'Invitation changed during join');
-    join = JSON.parse(winner.joining);
+  const owner = /^#[^:]+:(.+)$/.exec(alias)?.[1];
+  if (!owner || owner === server) missing();
+  const query = new URLSearchParams({room_alias: alias});
+  const directory = await joinRequest(home, server, owner, 'GET', 'v1/query/directory?' + query);
+  if (typeof directory.room_id !== 'string' || !/^![^:]+:.+$/.test(directory.room_id) ||
+      !Array.isArray(directory.servers) || !directory.servers.every(name => typeof name === 'string'))
+    fail(502, 'M_BAD_JSON', 'The alias owner returned an invalid room destination');
+  return {room_id: directory.room_id, servers: directory.servers.slice(0, 20)};
+}
+
+export function joinServers(room, params, local) {
+  const creator = /^![^:]+:(.+)$/.exec(room)?.[1];
+  if (!creator) return [];
+  const candidates = [...params.getAll('via'), ...params.getAll('server_name'), creator];
+  return [...new Set(candidates)].filter(peer => peer && peer !== local).slice(0, 5);
+}
+
+async function joinRequest(home, server, peer, method, path, content) {
+  let response;
+  try {
+    response = await remote(home, server, peer, method, '/_matrix/federation/' + path, content);
+  } catch (error) {
+    if (error.federationStatus === 403) fail(403, 'M_FORBIDDEN', 'The resident homeserver refused the join');
+    if (error.federationStatus === 404) fail(404, 'M_NOT_FOUND', 'The resident homeserver could not find the room');
+    throw error;
   }
-  const response = await request(
-    'PUT',
-    'v2/send_join/' + rid + '/' + encodeURIComponent(eventId(join,version)),
-    join
-  );
+  return JSON.parse(new TextDecoder().decode(await limited(response.body, 4 * 1024 * 1024)));
+}
+
+async function makeJoin(home, server, peer, user, room, expected) {
+  const path = 'v1/make_join/' + encodeURIComponent(room) + '/' + encodeURIComponent(user) + '?ver=10&ver=11';
+  const template = await joinRequest(home, server, peer, 'GET', path);
+  if (!['10','11'].includes(template.room_version) || (expected && template.room_version !== String(expected)))
+    fail(400, 'M_INCOMPATIBLE_ROOM_VERSION', 'Unsupported or changed room version');
+  const version = Number(template.room_version);
+  const p = template.event;
+  if (p?.room_id !== room || p.sender !== user || p.type !== 'm.room.member' ||
+      p.state_key !== user || p.content?.membership !== 'join')
+    fail(502, 'M_BAD_JSON', 'Invalid join template');
+  const event = await signPdu(home.identity, server, {
+    room_id: room, sender: user, state_key: user, type: p.type,
+    content: { membership: 'join', ...await home.profile?.(user,server) },
+    origin: server, origin_server_ts: Date.now(),
+    depth: p.depth, prev_events: p.prev_events, auth_events: p.auth_events
+  }, version);
+  return { peer, version, joining: JSON.stringify(event) };
+}
+
+async function pendingJoin(home, server, user, room, invite, candidates) {
+  if (invite) {
+    if (!invite.joining) {
+      const proposed = await makeJoin(home, server, invite.peer, user, room, invite.version ?? 10);
+      home.sql.exec('UPDATE remote_invites SET joining=COALESCE(joining,?) WHERE user=? AND room=? AND signed=?',
+        proposed.joining, user, room, invite.signed);
+    }
+    const pending = home.sql.exec('SELECT peer,version,joining FROM remote_invites WHERE user=? AND room=? AND signed=?',
+      user, room, invite.signed).toArray()[0];
+    if (!pending?.joining) fail(409, 'M_UNKNOWN', 'Invitation changed during join');
+    return pending;
+  }
+  const previous = () => home.sql.exec('SELECT peer,version,joining FROM public_joins WHERE user=? AND room=?',
+    user, room).toArray()[0];
+  const existing = previous();
+  if (existing) return existing;
+  let failure;
+  for (const peer of candidates) {
+    let proposal;
+    try {
+      proposal = await makeJoin(home, server, peer, user, room);
+    } catch (error) {
+      // Preserve an authoritative refusal if a later routing hint is unavailable.
+      if (!failure?.status || error.status === 403) failure = error;
+      continue;
+    }
+    // Save before send_join. Concurrent attempts and retries must use the same signed event.
+    home.sql.exec('INSERT OR IGNORE INTO public_joins VALUES(?,?,?,?,?)',
+      user, room, peer, proposal.version, proposal.joining);
+    return previous();
+  }
+  if (failure?.status) throw failure;
+  fail(502, 'M_UNABLE_TO_AUTHORISE_JOIN', 'No resident homeserver provided a join template');
+}
+
+export async function joinRemote(home, server, user, room, invite, candidates = []) {
+  await openParty(home, server, user);
+  const { peer, version, joining } = await pendingJoin(home, server, user, room, invite, candidates);
+  const join = JSON.parse(joining);
+  let response;
+  try {
+    response = await joinRequest(home, server, peer, 'PUT',
+      'v2/send_join/' + encodeURIComponent(room) + '/' + encodeURIComponent(eventId(join,version)), join);
+  } catch (error) {
+    if (!invite && (error.status === 403 || error.status === 404))
+      home.sql.exec('DELETE FROM public_joins WHERE user=? AND room=? AND joining=?', user, room, joining);
+    throw error;
+  }
   if (
     response.members_omitted ||
     !Array.isArray(response.auth_chain) ||
@@ -170,8 +209,10 @@ export async function joinRemote(home, server, user, room, invite) {
   const members = response.state.filter((p) => p.type === 'm.room.member');
   if (!members.some((m) => domain(m.state_key) === peer && m.content.membership === 'join'))
     fail(403, 'M_FORBIDDEN', 'The assisting server is not resident in this room');
-  if (!members.some((m) => m.state_key === user && eventId(m,version) === eventId(JSON.parse(invite.signed),version)))
+  if (invite && !members.some((m) => m.state_key === user && eventId(m,version) === eventId(JSON.parse(invite.signed),version)))
     fail(403, 'M_FORBIDDEN', 'The room state does not include the accepted invitation');
+  if (!invite && !response.state.some(p => p.type === 'm.room.join_rules' && p.state_key === '' && p.content.join_rule === 'public'))
+    fail(403, 'M_FORBIDDEN', 'A signed invitation is required for this room');
   for (const m of members)
     if (['join','invite'].includes(m.content.membership)) await openParty(home,server,m.state_key);
 
@@ -179,7 +220,7 @@ export async function joinRemote(home, server, user, room, invite) {
     const pending = home.sql.exec('SELECT signed FROM remote_invites WHERE user=? AND room=?',user,room).toArray()[0];
     const current = load(home,server,room);
     if (current.get('m.room.member',user)?.content.membership === 'join') return;
-    if (pending?.signed !== invite.signed) fail(409,'M_UNKNOWN','Invitation changed during join');
+    if (invite && pending?.signed !== invite.signed) fail(409,'M_UNKNOWN','Invitation changed during join');
     if (current.tips.size) {
       if (current.version !== version) fail(400,'M_INCOMPATIBLE_ROOM_VERSION','Room version changed');
       current.checkCurrent(join);
@@ -194,12 +235,8 @@ export async function joinRemote(home, server, user, room, invite) {
       home.sql.exec('INSERT INTO room_bases VALUES(?,?,?)',room,id,JSON.stringify(base.stateIds));
       save(home,{room,state,version,tips:new Set([id])},[join]);
     }
-    home.sql.exec(
-      'DELETE FROM remote_invites WHERE user=? AND room=? AND signed=?',
-      user,
-      room,
-      invite.signed
-    );
+    if (invite) home.sql.exec('DELETE FROM remote_invites WHERE user=? AND room=? AND signed=?', user, room, invite.signed);
+    home.sql.exec('DELETE FROM public_joins WHERE user=? AND room=?', user, room);
   });
   return ok({ room_id: room });
 }
