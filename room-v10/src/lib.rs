@@ -267,3 +267,11 @@ pub fn acl_allows(event_content: &str, server: &str) -> bool {
     let Ok(name) = <&ruma_common::ServerName>::try_from(server) else { return false; };
     content.is_allowed(name)
 }
+
+#[wasm_bindgen]
+pub fn redact_event(event: &str, version: Option<u8>) -> Result<String,String> {
+    let value = serde_json::from_str(event).map_err(|e| e.to_string())?;
+    let redacted = ruma_common::canonical_json::redact(value, &version_rules(version)?.redaction, None)
+        .map_err(|e| e.to_string())?;
+    serde_json::to_string(&redacted).map_err(|e| e.to_string())
+}

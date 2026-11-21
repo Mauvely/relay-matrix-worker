@@ -2,6 +2,7 @@
 import { remote, authenticatedOrigin } from './federation.js';
 
 export const mediaLimit = 1024 * 1024;
+const hostedLimit = 16 * mediaLimit;
 const rawHeaders = {
   'Access-Control-Allow-Origin': '*',
   'X-Content-Type-Options': 'nosniff',
@@ -65,6 +66,12 @@ export async function limited(stream, limit) {
   }
   return bytes.buffer;
 }
+async function readLocal(env, home, server, id) {
+  if (!id.startsWith('cloud-')) return home.mediaRead(id);
+  if (!env.CLOUD_MEDIA) throw Error('Hosted media storage unavailable');
+  return env.CLOUD_MEDIA.read(server, id.slice(6));
+}
+
 export async function mediaRoute(request, env, server, home, path, json) {
   const fed = /^\/_matrix\/federation\/v1\/media\/download\/([^/]+)$/.exec(path);
   const client =
@@ -78,7 +85,7 @@ export async function mediaRoute(request, env, server, home, path, json) {
       !(await authenticatedOrigin(request, server, async (name) => (await home.resolvePeer(name)).keys))
     )
       return json({ errcode: 'M_UNAUTHORIZED', error: 'Signed media request required' }, 401);
-    const m = await home.mediaRead(fed[1]);
+    const m = await readLocal(env, home, server, fed[1]);
     if (!m) return json({ errcode: 'M_NOT_FOUND', error: 'Unknown media' }, 404);
     const boundary = crypto.randomUUID();
     return new Response(packMedia(m.body, m.type, boundary), {
@@ -87,29 +94,46 @@ export async function mediaRoute(request, env, server, home, path, json) {
   }
   const auth = await home.session(request.headers.get('Authorization'), false);
   if (auth.status !== 200) return json(auth.body, auth.status);
-  if (client[1] === 'config' && request.method === 'GET') return json({ 'm.upload.size': mediaLimit });
-  if (client[1] === 'upload' && request.method === 'POST') {
-    let buffer;
-    try {
-      buffer = await limited(request.body, mediaLimit);
-    } catch {
-      return json({ errcode: 'M_TOO_LARGE', error: 'Spike upload limit is 1 MiB' }, 413);
+  if (client[1] === 'config' || client[1] === 'upload') {
+    const payer = await home.mediaAccount(server, auth.body.user_id);
+    const limit = payer ? hostedLimit : mediaLimit;
+    if (payer && !env.CLOUD_MEDIA)
+      return json({errcode:'M_UNAVAILABLE',error:'Hosted media storage unavailable'},503);
+    if (client[1] === 'config' && request.method === 'GET') return json({'m.upload.size':limit});
+    if (client[1] === 'upload' && request.method === 'POST') {
+      if (!(await home.mediaAllowed(server, auth.body.user_id)))
+        return json({errcode:'M_FORBIDDEN',error:'This account cannot share media'},403);
+      let buffer;
+      try {
+        buffer = await limited(request.body, limit);
+      } catch {
+        return json({errcode:'M_TOO_LARGE',error:'Attachment exceeds the media size limit'},413);
+      }
+      const mime = request.headers.get('Content-Type') ?? 'application/octet-stream';
+      let id;
+      if (payer) {
+        const key = crypto.randomUUID();
+        let status;
+        try {
+          status = await env.CLOUD_MEDIA.write(server,key,payer,mime,buffer);
+        } catch {
+          return json({errcode:'M_UNAVAILABLE',error:'Attachment storage unavailable'},503);
+        }
+        if (status === 507) return json({errcode:'M_RESOURCE_LIMIT_EXCEEDED',error:'Cloud storage is full'},507);
+        if (status !== 201 && status !== 200)
+          return json({errcode:'M_UNAVAILABLE',error:'Attachment could not be stored'},503);
+        id = 'cloud-' + key;
+      } else {
+        id = await home.mediaWrite(buffer,mime);
+      }
+      return json({content_uri:'mxc://' + server + '/' + id});
     }
-    const allowed = await home.mediaAllowed(server, auth.body.user_id);
-    if (!allowed) return json({ errcode: 'M_FORBIDDEN', error: 'This account cannot share media' }, 403);
-    return json({
-      content_uri:
-        'mxc://' +
-        server +
-        '/' +
-        (await home.mediaWrite(buffer, request.headers.get('Content-Type') ?? 'application/octet-stream'))
-    });
   }
   if (['download','thumbnail'].includes(client[1]) && request.method === 'GET' && client[3]) {
     const peer = decodeURIComponent(client[2]),
       id = decodeURIComponent(client[3]);
     let m;
-    if (server === peer) m = await home.mediaRead(id);
+    if (server === peer) m = await readLocal(env, home, server, id);
     else {
       if (!(await home.mediaAllowed(server, auth.body.user_id)))
         return json(
@@ -142,5 +166,5 @@ export async function getRemote(home, server, peer, id) {
     'GET',
     '/_matrix/federation/v1/media/download/' + encodeURIComponent(id)
   );
-  return unpackMedia(await limited(r.body, Math.max(mediaLimit,2*1024*1024) + 32768), r.headers.get('Content-Type') ?? '');
+  return unpackMedia(await limited(r.body, hostedLimit + 32768), r.headers.get('Content-Type') ?? '');
 }

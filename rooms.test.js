@@ -45,6 +45,7 @@ for (const version of [10,11]) test(`private v${version} room checks invitations
     room_version: String(version),
     initial_state: [{ type: 'm.room.encryption', content: { algorithm: 'm.megolm.v1.aes-sha2' } }]
   });
+  await roomClient(home,server,{user_id:user},'PUT',[room,'send','m.room.message','before'],{msgtype:'m.text',body:'before membership'});
   const make = () =>
     fedRoom(home, server, peer, 'GET', ['make_join', room, other], new URLSearchParams({ver:String(version)}));
   await assert.rejects(make, /invitation/);
@@ -109,6 +110,41 @@ for (const version of [10,11]) test(`private v${version} room checks invitations
   );
   await assert.rejects(messages(user, { dir: 'b', from: '!another:server/9' }), /history token/);
   await assert.rejects(messages('@stranger:' + server, { dir: 'b' }), /membership/i);
+  const one = await roomClient(home,server,{user_id:user},'PUT',[room,'send','m.room.message','seen'],{msgtype:'m.text',body:'visible'});
+  const tail = await roomClient(home,server,{user_id:user},'PUT',[room,'send','m.room.message','tail'],{msgtype:'m.text',body:'tip'});
+  const gapRequest={earliest_events:[], latest_events:[tail.body.event_id],limit:50};
+  const gap = await fedRoom(home,server,peer,'POST',['get_missing_events',room],new URLSearchParams(),gapRequest);
+  assert.equal(gap.body.events.at(-1).content.body,'visible');
+  const text = gap.body.events.filter((e) => e.type === 'm.room.message');
+  assert.deepEqual(text.map((e) => e.content.body),[undefined,'visible']);
+  assert.ok(text[0].signatures[server]);
+  assert.ok(gap.body.events.every((e) => eventId(e,version) !== tail.body.event_id));
+  const afterFirst = {...gapRequest,earliest_events:[one.body.event_id]};
+  assert.deepEqual((await fedRoom(home,server,peer,'POST',['get_missing_events',room],new URLSearchParams(),afterFirst)).body.events,[]);
+  await assert.rejects(fedRoom(home,server,'stranger.test','POST',['get_missing_events',room],new URLSearchParams(),gapRequest),/joined/);
+
+  const {recoverPredecessors} = await import('./src/gaps.js');
+  const branch = load(home,server,room);
+  const branchEvents=[];
+  for (const body of ['first missing','second missing','last received']) {
+    branchEvents.push(await branch.local(remote,other,'m.room.message',{msgtype:'m.text',body}));
+  }
+  const arriving=branchEvents.at(-1);
+  const recovered=await recoverPredecessors(home,server,peer,arriving,async (_h,_s,_p,method,uri,body) => {
+    assert.equal(method,'POST');
+    assert.ok(uri.includes('get_missing_events'));
+    assert.deepEqual(body.latest_events,[eventId(arriving,version)]);
+    return Response.json({events:branchEvents.slice(0,2).toReversed()});
+  });
+  assert.deepEqual(recovered,branchEvents.slice(0,2));
+  await assert.rejects(recoverPredecessors(home,server,peer,arriving,async () =>
+    Response.json({events:[]})),/complete predecessor chain/);
+  const wrongSignature={...recovered[1],signatures:{}};
+  await assert.rejects(receiveEvent(home,server,peer,arriving,[recovered[0],wrongSignature]));
+  assert.equal(load(home,server,room).events.has(eventId(recovered[0],version)),false);
+  await receiveEvent(home,server,peer,arriving,recovered);
+  await receiveEvent(home,server,peer,arriving,recovered);
+  assert.equal((await messages(user,{dir:'b',limit:1})).chunk[0].content.body,'last received');
   const acl = (allow,deny) => roomClient(home,server,{user_id:user},'PUT',[room,'state','m.room.server_acl',''],{allow,deny});
   await acl(['*'],['synapse.*']);
   await assert.rejects(make,(e) => e.status===403 && e.errcode==='M_FORBIDDEN');

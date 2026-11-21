@@ -119,7 +119,7 @@ export async function clientApi(home, server, auth, method, parts, params, body)
   }
   missing();
 }
-export async function federationApi(home, server, peer, method, parts, params, body) {
+export async function federationApi(home, server, peer, method, parts, params, body, gaps = new Map()) {
   if (
     parts[0] === 'user' &&
     parts[1] === 'keys' &&
@@ -150,7 +150,7 @@ export async function federationApi(home, server, peer, method, parts, params, b
   }
   if (parts[0] === 'invite' && method === 'PUT')
     return receiveInvite(home, server, peer, parts[1], parts[2], body);
-  if (parts[0] === 'make_join' || parts[0] === 'send_join')
+  if (['make_join','send_join','get_missing_events'].includes(parts[0]))
     return fedRoom(home, server, peer, method, parts, params, body);
   if (parts[0] === 'send' && method === 'PUT') {
     if (
@@ -167,7 +167,7 @@ export async function federationApi(home, server, peer, method, parts, params, b
     // Have it retry the transaction as soon as the signed history is committed.
     for (const p of body.pdus) {
       if (
-        typeof p.room_id === 'string' &&
+        p && typeof p.room_id === 'string' &&
         home.sql
           .exec('SELECT 1 FROM remote_invites WHERE room=? AND joining IS NOT NULL LIMIT 1', p.room_id)
           .toArray().length
@@ -182,9 +182,13 @@ export async function federationApi(home, server, peer, method, parts, params, b
       let id;
       try {
         id = eventId(p,roomVersion(home.sql,p.room_id));
-        await receiveEvent(home, server, peer, p);
+        const recovered = gaps.get(p);
+        // Other PDUs in this transaction may already have filled the gap.
+        await receiveEvent(home, server, peer, p, Array.isArray(recovered) ? recovered : []);
         pdus[id] = {};
       } catch (e) {
+        if (e.status === 503)
+          return {status:503,body:{errcode:'M_UNAVAILABLE',error:'Predecessor recovery pending'}};
         if (id) pdus[id] = { error: e.message ?? String(e) };
       }
     }

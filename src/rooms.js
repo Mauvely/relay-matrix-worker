@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
+import { saveAudience, missingEvents } from './history.js';
 import { acl_allows } from '../room-v10/pkg/relay_room_v10.js';
 import { verificationKeys } from './identity.js';
 import { StoredEvents } from './stored-events.js';
@@ -16,6 +17,8 @@ const unready = (msg) => fail(503, 'M_UNAVAILABLE', msg);
 export const isObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
 export function schema(sql) {
   sql.exec(`CREATE TABLE IF NOT EXISTS room_events(seq INTEGER PRIMARY KEY AUTOINCREMENT,room TEXT,eid TEXT UNIQUE,pdu TEXT);
+    CREATE TABLE IF NOT EXISTS history_audience_refs(room TEXT,eid TEXT,source TEXT,PRIMARY KEY(room,eid));
+    CREATE TABLE IF NOT EXISTS history_audiences(room TEXT,source TEXT,audience TEXT,PRIMARY KEY(room,source));
     CREATE TABLE IF NOT EXISTS room_versions(room TEXT PRIMARY KEY,version INTEGER NOT NULL);
     CREATE TABLE IF NOT EXISTS room_outliers(room TEXT,eid TEXT PRIMARY KEY,position INTEGER,pdu TEXT);
     CREATE INDEX IF NOT EXISTS room_outlier_order ON room_outliers(room,position);
@@ -57,16 +60,14 @@ export function load(home, server, room) {
 // Until managed-room reconciliations can run atomically, these new live room routes
 // admit only personal and explicitly open accounts. Existing device rules still apply.
 export async function openParty(home, server, user) {
-  if (!domain(user)) invalid('A full Matrix user ID is required');
-  if (domain(user) !== server) {
-    try {
-      await peerRecord(home, domain(user));
-    } catch {
-      unready('Could not establish the federation peer identity');
-    }
-    return;
-  }
-  const p = await home.party(user, server);
+  const host = domain(user);
+  if (!host) invalid('A full Matrix user ID is required');
+  // Local room reads and writes can continue while an independent peer is offline.
+  // Resolve hosted account policy via the account's tenant. The transport verifies
+  // the independent server's identity when delivering or accepting federation.
+  if (host !== server && !Object.values(home.env.DOMAINS ?? {}).includes(host)) return;
+  const p = host === server ? await home.party(user, server)
+    : await home.env.HOMESERVERS.getByName(host).party(user, host);
   if (!p) missing();
   if (p.organisationId !== null && home.env.ORGANISATIONS?.[p.organisationId]?.policy !== 'open')
     denied('Managed room operations are unavailable for this account');
@@ -85,13 +86,15 @@ export function save(home, g, pdus) {
   let firstInserted;
   let lastInserted;
   for (const p of pdus) {
+    const id = eventId(p,g.version);
     const row = home.sql.exec(
       'INSERT OR IGNORE INTO room_events(room,eid,pdu) VALUES(?,?,?) RETURNING seq',
       g.room,
-      eventId(p,g.version),
+      id,
       JSON.stringify(p)
     ).toArray()[0];
     if (row) {
+      saveAudience(home.sql,g,id,p);
       firstInserted ??= row.seq;
       lastInserted = row.seq;
     }
@@ -424,6 +427,10 @@ export async function fedRoom(home, server, peer, method, parts, params, body) {
   await checkParties(home, server, g);
   requireRoomAccess(g.get('m.room.server_acl'),peer);
   if (g.get('m.room.create')?.content['m.federate'] === false) denied('Federation disabled');
+  if (action === 'get_missing_events' && method === 'POST') {
+    if (!g.members('join').some((e) => domain(e.state_key) === peer)) denied('Server is not joined');
+    return ok({events:missingEvents(home.sql,g,peer,body)});
+  }
   if (action === 'make_join' && method === 'GET') {
     if (domain(value) !== peer) denied('Origin must own user');
     if (!params.getAll('ver').includes(String(g.version)))
@@ -484,21 +491,29 @@ export async function fedRoom(home, server, peer, method, parts, params, body) {
   missing();
 }
 
-export async function receiveEvent(home, server, peer, pdu) {
-  if (domain(pdu.sender) !== peer) denied('Unsupported relayed origin');
+export async function receiveEvent(home, server, peer, pdu, recovered = []) {
   const g = load(home, server, pdu.room_id);
   if (!g.tips.size || !g.members('join').some((e) => domain(e.state_key) === server)) missing();
   requireRoomAccess(g.get('m.room.server_acl'),peer);
   if (g.events.has(eventId(pdu,g.version))) return;
+  if (!g.members('join').some((m) => domain(m.state_key) === peer)) denied('Sending server is not resident');
   await checkParties(home, server, g);
-  if (g.get('m.room.member', pdu.sender)?.content.membership !== 'join')
-    denied('Sender is not currently joined');
-  if (pdu.type === 'm.room.member') await openParty(home, server, pdu.state_key);
-  // A stale branch can have valid historical authorization and still fail current
-  // authorization. Check both snapshots before making its event visible to clients.
-  g.checkCurrent(pdu);
-  g.add(pdu);
-  commit(home, server, g, [pdu]);
+  const additions = [];
+  for (const event of [...recovered,pdu]) {
+    if (event.room_id !== g.room) invalid('Room ID mismatch');
+    if (g.events.has(eventId(event,g.version))) continue;
+    requireRoomAccess(g.get('m.room.server_acl'),peer);
+    requireRoomAccess(g.get('m.room.server_acl'),domain(event.sender));
+    if (!Array.isArray(event.prev_events) || event.prev_events.some((id) => !g.events.has(id)))
+      unready('Missing predecessor');
+    if (event.type === 'm.room.member') await openParty(home,server,event.state_key);
+    const author = domain(event.sender);
+    if (author !== server && !g.keys[author]) g.keys[author] = (await peerRecord(home,author)).keys;
+    g.checkCurrent(event);
+    g.add(event);
+    additions.push(event);
+  }
+  if (additions.length) commit(home,server,g,additions);
 }
 // The timeline is in local stream order. Its starting state must reflect all branches
 // already committed at that point, including when an older device missed a fork.

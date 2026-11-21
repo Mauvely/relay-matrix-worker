@@ -11,6 +11,7 @@ import { openParty, queue, schema, roomSync, queueProfileUpdates, publishProfile
 import { authenticatedOrigin, remote, authenticateQuery } from './federation.js';
 import { delegated, ensureManagedAccount, issueLoginCode, redeemLoginCode, ssoRedirect, login, provision, session } from './accounts.js';
 import { replayProbe, verifyFixtureHistory } from './probe.js';
+import { recoverPredecessors } from './gaps.js';
 import { DurableObject, WorkerEntrypoint } from 'cloudflare:workers';
 import { discoverPeer } from './discovery.js';
 import { canonical, initializeIdentity, signServerKeys } from './identity.js';
@@ -92,11 +93,24 @@ export class Homeserver extends DurableObject {
           parts[1]
         )
         .toArray()[0];
+    const gaps = new Map();
+    if (peer && parts[0] === 'send' && method === 'PUT' && body.origin === peer &&
+        Array.isArray(body.pdus) && body.pdus.length <= 50 && (body.edus?.length ?? 0) <= 100 &&
+        !this.sql.exec('SELECT 1 FROM received WHERE id=?',JSON.stringify(['txn',peer,parts[1]])).toArray().length) {
+      for (const pdu of body.pdus) {
+        if (!pdu || typeof pdu.room_id !== 'string') continue;
+        try {
+          gaps.set(pdu,await recoverPredecessors(this,server,peer,pdu));
+        } catch (error) {
+          gaps.set(pdu,error);
+        }
+      }
+    }
     const run = async () => {
       try {
         if (invite) return await joinRemote(this, server, auth.user_id, parts[1], invite);
         const args = [this, server, peer || auth, method, parts, new URLSearchParams(query), body];
-        return peer ? await federationApi(...args) : await clientApi(...args);
+        return peer ? await federationApi(...args,gaps) : await clientApi(...args);
       } catch (e) {
         return {
           status: e.status ?? 400,
@@ -122,6 +136,13 @@ export class Homeserver extends DurableObject {
       await this.ctx.storage.setAlarm(Date.now() + 20);
     return JSON.parse(JSON.stringify(result));
   }
+  async mediaAccount(server, user) {
+    if (!user.endsWith(':' + server)) throw Error('Wrong homeserver for upload');
+    const account = await this.ctx.storage.get('account/' + user.slice(1, -server.length - 1));
+    if (account?.userId !== user) throw Error('Unknown uploader');
+    return account.accountId ?? null;
+  }
+
   async mediaAllowed(server, user) {
     try {
       await openParty(this, server, user);
