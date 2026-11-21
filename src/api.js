@@ -167,7 +167,12 @@ export async function federationApi(home, server, peer, method, parts, params, b
   }
   if (parts[0] === 'invite' && method === 'PUT')
     return receiveInvite(home, server, peer, parts[1], parts[2], body);
-  if (['make_join','send_join','get_missing_events'].includes(parts[0]))
+  if (parts[0] === 'event' && method === 'GET') {
+    const row = home.sql.exec('SELECT room FROM room_events WHERE eid=?',parts[1]).toArray()[0];
+    if (!row) missing();
+    return fedRoom(home,server,peer,method,['event',row.room,parts[1]],params);
+  }
+  if (['make_join','send_join','get_missing_events','backfill'].includes(parts[0]))
     return fedRoom(home, server, peer, method, parts, params, body);
   if (parts[0] === 'send' && method === 'PUT') {
     if (

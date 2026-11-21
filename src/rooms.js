@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 import { canonical } from './identity.js';
-import { saveAudience, missingEvents } from './history.js';
+import { disclosedEvent, saveAudience, missingEvents } from './history.js';
 import { acl_allows } from '../room-v10/pkg/relay_room_v10.js';
 import { verificationKeys } from './identity.js';
 import { StoredEvents } from './stored-events.js';
@@ -18,6 +18,9 @@ const unready = (msg) => fail(503, 'M_UNAVAILABLE', msg);
 export const isObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
 export function schema(sql) {
   sql.exec(`CREATE TABLE IF NOT EXISTS room_events(seq INTEGER PRIMARY KEY AUTOINCREMENT,room TEXT,eid TEXT UNIQUE,pdu TEXT);
+    CREATE TABLE IF NOT EXISTS room_soft_failures(room TEXT,eid TEXT,PRIMARY KEY(room,eid));
+    CREATE VIEW IF NOT EXISTS room_client_events AS SELECT seq,room,eid,pdu FROM room_events e
+      WHERE NOT EXISTS(SELECT 1 FROM room_soft_failures f WHERE f.room=e.room AND f.eid=e.eid);
     CREATE TABLE IF NOT EXISTS history_audience_refs(room TEXT,eid TEXT,source TEXT,PRIMARY KEY(room,eid));
     CREATE TABLE IF NOT EXISTS history_audiences(room TEXT,source TEXT,audience TEXT,PRIMARY KEY(room,source));
     CREATE TABLE IF NOT EXISTS room_versions(room TEXT PRIMARY KEY,version INTEGER NOT NULL);
@@ -41,6 +44,9 @@ export function schema(sql) {
 export function roomVersion(sql, room) {
   return sql.exec('SELECT version FROM room_versions WHERE room=?', room).toArray()[0]?.version ?? 10;
 }
+function softFailures(sql,room) {
+  return new Set(sql.exec('SELECT eid FROM room_soft_failures WHERE room=?',room).toArray().map(row=>row.eid));
+}
 export function load(home, server, room) {
   const version = roomVersion(home.sql,room);
   const sql = home.sql;
@@ -49,7 +55,7 @@ export function load(home, server, room) {
   if (!tips.size) {
     // Rooms from before the checkpoint schema have at most 512 PDUs. Rebuild their tips once.
     const rows = sql.exec('SELECT eid,pdu FROM room_events WHERE room=? ORDER BY seq', room).toArray();
-    const graph = new RoomGraph(room, keys, rows, undefined, undefined, version);
+    const graph = new RoomGraph(room, keys, rows, undefined, undefined, version,softFailures(sql,room));
     if (rows.length) home.ctx.storage.transactionSync(() => {
       for (const id of graph.tips) sql.exec('INSERT OR IGNORE INTO room_tips VALUES(?,?)', room, id);
     });
@@ -57,7 +63,7 @@ export function load(home, server, room) {
   }
   const state = new Map(sql.exec('SELECT kind,skey,eid FROM room_state WHERE room=?', room).toArray()
     .map((r) => [JSON.stringify([r.kind, r.skey]), r.eid]));
-  return new RoomGraph(room, keys, [], {state, tips, events: new StoredEvents(sql, room)},undefined,version);
+  return new RoomGraph(room, keys, [], {state, tips, events: new StoredEvents(sql, room)},undefined,version,softFailures(sql,room));
 
 }
 // Until managed-room reconciliations can run atomically, these new live room routes
@@ -97,6 +103,8 @@ export function save(home, g, pdus) {
       JSON.stringify(p)
     ).toArray()[0];
     if (row) {
+      if (g.softFailed?.has(id))
+        home.sql.exec('INSERT INTO room_soft_failures VALUES(?,?)',g.room,id);
       saveAudience(home.sql,g,id,p);
       firstInserted ??= row.seq;
       lastInserted = row.seq;
@@ -132,6 +140,7 @@ export function queue(home, server, peer, pdus, edus = []) {
 function commit(home, server, g, events, extra) {
   home.ctx.storage.transactionSync(() => {
     save(home, g, events);
+    if (g.softFailed?.size) events = events.filter(event => !g.softFailed.has(eventId(event,g.version)));
     for (const peer of new Set(g.members('join').map((e) => domain(e.state_key))))
       if (peer !== server && events.some((e) => domain(e.sender) === server))
         queue(
@@ -278,10 +287,10 @@ function pagePosition(room, value, fallback) {
 // A profile update is another membership event with membership=join. It must not
 // move the history boundary. A leave followed by a rejoin establishes a new one.
 function joinFloor(home, room, user) {
-  return home.sql.exec(`SELECT MIN(seq) AS floor FROM room_events WHERE room=?1
+  return home.sql.exec(`SELECT MIN(seq) AS floor FROM room_client_events WHERE room=?1
     AND json_extract(pdu,'$.type')='m.room.member' AND json_extract(pdu,'$.state_key')=?2
     AND json_extract(pdu,'$.content.membership')='join' AND seq>COALESCE((
-      SELECT MAX(seq) FROM room_events WHERE room=?1 AND json_extract(pdu,'$.type')='m.room.member'
+      SELECT MAX(seq) FROM room_client_events WHERE room=?1 AND json_extract(pdu,'$.type')='m.room.member'
       AND json_extract(pdu,'$.state_key')=?2 AND json_extract(pdu,'$.content.membership')!='join'),0)`,room,user).one().floor;
 }
 
@@ -291,7 +300,7 @@ function messagePage(home, room, user, params) {
   const backwards = dir === 'b';
   const floor = joinFloor(home, room, user);
   if (floor === null) denied('No local room membership');
-  const ceiling = home.sql.exec('SELECT MAX(seq)+1 AS n FROM room_events WHERE room=?', room).one().n;
+  const ceiling = home.sql.exec('SELECT MAX(seq)+1 AS n FROM room_client_events WHERE room=?', room).one().n;
   const from = pagePosition(room, params.get('from'), backwards ? ceiling : floor);
   const to = pagePosition(room, params.get('to'), backwards ? floor : ceiling);
   const limit = Number(params.get('limit') ?? 10);
@@ -300,7 +309,7 @@ function messagePage(home, room, user, params) {
   if (!isObject(filter)) invalid('Invalid room filter');
   const rows = home.sql
     .exec(
-      'SELECT seq,eid,pdu FROM room_events WHERE room=? AND seq>=? AND seq<? ORDER BY seq ' +
+      'SELECT seq,eid,pdu FROM room_client_events WHERE room=? AND seq>=? AND seq<? ORDER BY seq ' +
         (backwards ? 'DESC' : 'ASC') + ' LIMIT 101',
       room,
       Math.max(floor, backwards ? to : from),
@@ -435,6 +444,20 @@ export async function fedRoom(home, server, peer, method, parts, params, body) {
     if (!g.members('join').some((e) => domain(e.state_key) === peer)) denied('Server is not joined');
     return ok({events:missingEvents(home.sql,g,peer,body)});
   }
+  if (method === 'GET' && ['event','backfill'].includes(action)) {
+    if (!g.members('join').some(e=>domain(e.state_key)===peer)) denied('Server is not joined');
+    let pdus;
+    if (action === 'event') {
+      const event = g.events.get(value);
+      if (!event) missing();
+      pdus = [disclosedEvent(home.sql,g,peer,value,event)];
+    } else {
+      const v = params.getAll('v'), limit = params.get('limit');
+      if (!v.length || !limit || !/^\d+$/.test(limit)) invalid('Expected event IDs and a backfill limit');
+      pdus = missingEvents(home.sql,g,peer,{earliest_events:[],latest_events:v,limit:Number(limit)},true);
+    }
+    return ok({origin:server,origin_server_ts:Date.now(),pdus});
+  }
   if (action === 'make_join' && method === 'GET') {
     if (domain(value) !== peer) denied('Origin must own user');
     if (!params.getAll('ver').includes(String(g.version)))
@@ -513,8 +536,9 @@ export async function receiveEvent(home, server, peer, pdu, recovered = []) {
     if (event.type === 'm.room.member') await openParty(home,server,event.state_key);
     const author = domain(event.sender);
     if (author !== server) g.keys[author] = await keysForEvent(home, author, event);
-    g.checkCurrent(event);
-    g.add(event);
+    let softFailed = false;
+    try { g.checkCurrent(event); } catch { softFailed = true; }
+    g.add(event,softFailed);
     additions.push(event);
   }
   if (additions.length) commit(home,server,g,additions);
@@ -536,7 +560,7 @@ function stateBeforeStream(home, server, room, firstSeq) {
   const store = new StoredEvents(home.sql, room);
   const base = store.joinBase();
   if (base && !prior.length) return base.stateIds.map((id) => clientEvent(store.get(id),id));
-  const prefix = new RoomGraph(room, keys, prior, undefined, base,roomVersion(home.sql,room));
+  const prefix = new RoomGraph(room, keys, prior, undefined, base,roomVersion(home.sql,room),softFailures(home.sql,room));
   return [...prefix.state.values()].map((id) => clientEvent(prefix.events.get(id) ?? store.get(id), id));
 }
 export async function roomSync(home, server, user, cursor, initial) {
@@ -552,7 +576,7 @@ export async function roomSync(home, server, user, cursor, initial) {
     const membership = JSON.parse(row.pdu).content.membership;
     if (
       !initial &&
-      !home.sql.exec('SELECT 1 FROM room_events WHERE room=? AND seq>? LIMIT 1', row.room, cursor).toArray()
+      !home.sql.exec('SELECT 1 FROM room_client_events WHERE room=? AND seq>? LIMIT 1', row.room, cursor).toArray()
         .length
     )
       continue;
@@ -595,7 +619,7 @@ export async function roomSync(home, server, user, cursor, initial) {
       const joinedNow = initial || sinceJoin > cursor;
       const rows = home.sql
         .exec(
-          'SELECT seq,pdu,eid FROM room_events WHERE room=? AND seq>=? ORDER BY seq DESC LIMIT 51',
+          'SELECT seq,pdu,eid FROM room_client_events WHERE room=? AND seq>=? ORDER BY seq DESC LIMIT 51',
           row.room,
           Math.max(sinceJoin, cursor + 1)
         )
@@ -617,7 +641,7 @@ export async function roomSync(home, server, user, cursor, initial) {
       };
       if (limited && !joinedNow) {
         const skipped = home.sql.exec(
-          "SELECT DISTINCT json_extract(pdu,'$.state_key') AS member FROM room_events WHERE room=? AND seq>? AND seq<? AND json_extract(pdu,'$.type')='m.room.member'",
+          "SELECT DISTINCT json_extract(pdu,'$.state_key') AS member FROM room_client_events WHERE room=? AND seq>? AND seq<? AND json_extract(pdu,'$.type')='m.room.member'",
           row.room, cursor, rows[0].seq
         ).toArray();
         for (const m of skipped) changed.add(m.member);

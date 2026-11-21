@@ -181,6 +181,42 @@ for (const version of [10,11]) test(`private v${version} room checks invitations
   assert.equal(sql.exec('SELECT COUNT(*) AS n FROM federation_gap_events').one().n,0);
   assert.deepEqual((await messages(user,{dir:'b',limit:11})).chunk.map(e => e.content.body),
     chain.map(e=>e.content.body).reverse());
+  // The remote topic was valid when authored. While its server was offline,
+  // the local admin raised the power needed to change the topic.
+  const power = load(home,server,room).get('m.room.power_levels').content;
+  const topicPower = level => roomClient(home,server,{user_id:user},'PUT',[room,'state','m.room.power_levels',''],
+    {...power, events:{...power.events,'m.room.topic':level}});
+  await topicPower(0);
+  const delayed = await load(home,server,room).local(remote,other,'m.room.topic',{topic:'Before permission changed'},'');
+  const delayedId = eventId(delayed,version);
+  await topicPower(50);
+  const checkpoint = await roomSync(home,server,user,0,true);
+  await assert.rejects(receiveEvent(home,server,peer,{...delayed,signatures:{}}));
+  await receiveEvent(home,server,peer,delayed);
+  const current = load(home,server,room);
+  assert.ok(current.softFailed.has(delayedId));
+  assert.ok(!current.tips.has(delayedId));
+  assert.notEqual(current.get('m.room.topic')?.content.topic,delayed.content.topic);
+  assert.ok(!(await messages(user,{dir:'b',limit:100})).chunk.some(e=>e.event_id===delayedId));
+  assert.equal((await roomSync(home,server,user,checkpoint.high,false)).rooms.join[room],undefined);
+  const child = current.template(other,'m.room.message',{msgtype:'m.text',body:'After reconnect'});
+  assert.ok(!child.prev_events.includes(delayedId));
+  child.prev_events.push(delayedId);
+  child.depth = 1 + Math.max(...child.prev_events.map(id=>current.events.get(id).depth));
+  const merged = await signPdu(remote,peer,child,version);
+  await receiveEvent(home,server,peer,merged);
+  assert.deepEqual([...load(home,server,room).tips],[eventId(merged,version)]);
+  assert.equal((await messages(user,{dir:'b',limit:1})).chunk[0].content.body,'After reconnect');
+  const history=await fedRoom(home,server,peer,'POST',['get_missing_events',room],new URLSearchParams(),
+    {earliest_events:[],latest_events:[eventId(merged,version)],limit:10});
+  assert.ok(history.body.events.some(e=>eventId(e,version)===delayedId));
+  const direct = () => federationApi(home,server,peer,'GET',['event',delayedId],new URLSearchParams());
+  assert.equal((await direct()).body.pdus[0].content.topic,delayed.content.topic);
+  await assert.rejects(federationApi(home,server,'outsider.test','GET',['event',delayedId],new URLSearchParams()));
+  const backfill = (id,limit) => fedRoom(home,server,peer,'GET',['backfill',room],new URLSearchParams({v:id,limit}));
+  assert.deepEqual((await backfill(delayedId,'5')).body.pdus,[]);
+  assert.ok((await backfill(eventId(merged,version),'5')).body.pdus.some(e=>eventId(e,version)===delayedId));
+  assert.deepEqual((await backfill(eventId(merged,version),'1')).body.pdus,[merged]);
   const acl = (allow,deny) => roomClient(home,server,{user_id:user},'PUT',[room,'state','m.room.server_acl',''],{allow,deny});
   await acl(['*'],['synapse.*']);
   await assert.rejects(make,(e) => e.status===403 && e.errcode==='M_FORBIDDEN');

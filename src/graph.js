@@ -34,7 +34,8 @@ export async function signPdu(identity, server, pdu, version = 10) {
   };
 }
 export class RoomGraph {
-  constructor(room, keys, rows = [], stored, base, version = 10) {
+  constructor(room, keys, rows = [], stored, base, version = 10, softFailed = new Set()) {
+    this.softFailed = softFailed;
     this.base = base;
     this.version = version;
     this.room = room;
@@ -47,13 +48,16 @@ export class RoomGraph {
       return;
     }
     this.events = new Map(rows.map(({ eid, pdu }) => [eid, JSON.parse(pdu)]));
-    this.tips = new Set(this.events.keys());
-    for (const event of this.events.values()) for (const id of event.prev_events) this.tips.delete(id);
+    this.tips = new Set([...this.events.keys()].filter(id => !this.softFailed.has(id)));
+    for (const [id,event] of this.events) {
+      if (!this.softFailed.has(id)) for (const prev of event.prev_events) this.tips.delete(prev);
+    }
     this.resolve();
   }
-  resolve() {
+  resolve(tips = this.tips) {
     this.unchangedState = false;
-    const state = this.resolved([...this.events.values()]);
+    const events = this.softFailed.size ? this.ancestry(tips) : [...this.events.values()];
+    const state = this.resolved(events);
     this.state = new Map(state.map(([type, key, id]) => [JSON.stringify([type, key]), id]));
   }
   resolved(events) {
@@ -94,6 +98,11 @@ export class RoomGraph {
   before(parents) {
     if (parents.length === this.tips.size && [...this.tips].every((id) => parents.includes(id)))
       return [...this.state.values()].map((id) => this.events.get(id));
+    return this.resolved(this.ancestry(parents)).map(([, , id]) =>
+      this.events.get(id) ?? this.base?.auth.find((p) => eventId(p,this.version) === id)
+    );
+  }
+  ancestry(parents) {
     const base = this.base ?? this.events.joinBase?.();
     const anchor = base && eventId(base.join,this.version);
     const ancestors = new Set(),
@@ -107,19 +116,25 @@ export class RoomGraph {
         if (id !== anchor) pending.push(...p.prev_events);
       }
     }
-    const events = [...this.events.entries()].filter(([id]) => ancestors.has(id)).map(([, p]) => p);
-    return this.resolved(events).map(([, , id]) =>
-      this.events.get(id) ?? this.base?.auth.find((p) => eventId(p,this.version) === id)
-    );
+    return [...this.events.entries()].filter(([id]) => ancestors.has(id)).map(([, p]) => p);
   }
   checkCurrent(pdu) {
     const state = [...this.state.values()].map((id) => ({ ...this.events.get(id), event_id: id }));
     check_current(JSON.stringify({ ...pdu, event_id: eventId(pdu,this.version) }), JSON.stringify(state),this.version);
   }
-  add(pdu) {
+  add(pdu, softFailed = false) {
     if (pdu.room_id !== this.room) throw Error('Room ID mismatch');
     const id = eventId(pdu,this.version);
     if (this.events.has(id)) return;
+    if (softFailed) {
+      // Check signatures, declared auth and auth at the actual parents. Keep
+      // the event for later descendants without making it a local extremity.
+      this.events.set(id,pdu);
+      try { this.resolved(this.ancestry([id])); }
+      catch (error) { this.events.delete(id); throw error; }
+      this.softFailed.add(id);
+      return;
+    }
     if (this.tips.size === 1 && pdu.prev_events?.length === 1 && this.tips.has(pdu.prev_events[0])) {
       const checked = (id) => {
         const event = this.events.get(id);
@@ -135,7 +150,10 @@ export class RoomGraph {
       }
     } else {
       this.events.set(id, pdu);
-      try { this.resolve(); } catch (error) { this.events.delete(id); throw error; }
+      const tips = new Set(this.tips);
+      for (const prev of pdu.prev_events) tips.delete(prev);
+      tips.add(id);
+      try { this.resolve(tips); } catch (error) { this.events.delete(id); throw error; }
     }
     for (const prev of pdu.prev_events) this.tips.delete(prev);
     this.tips.add(id);
