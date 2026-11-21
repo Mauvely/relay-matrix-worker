@@ -22,3 +22,11 @@ test('a correctly signed power-level change by an ordinary joined member is deni
   const denied = JSON.parse(readFileSync(new URL('./fixtures/denied-power.json', import.meta.url)));
   assert.throws(() => replay(JSON.stringify([...pdus, denied]), keys), /power|authoris|authoriz|level/i);
 });
+
+test('a signed redacted predecessor is valid history and cannot supply replacement content', () => {
+  const redacted = {...forks[0], content: {}};
+  const result = JSON.parse(replay(JSON.stringify([...pdus,redacted]),keys));
+  assert.ok(result.some(([type]) => type === 'm.room.topic'));
+  assert.throws(() => replay(JSON.stringify([...pdus,{...redacted,content:{topic:'different'}}]),keys));
+  assert.throws(() => replay(JSON.stringify([...pdus,{...redacted,signatures:{}}]),keys));
+});

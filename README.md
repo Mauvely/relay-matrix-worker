@@ -12,7 +12,7 @@ Set `PROVISION_TOKEN` with Wrangler. An authenticated operator can POST a JSON o
 
 For hosted to-device traffic, `ORGANISATIONS` maps stable organisation IDs to a policy of `open`, `closed` or `allowlist`. An allowlisted organisation supplies `allow` with its partner IDs. Both directions must permit communication. A missing policy stops delivery. Each device sync reads its own queue, rechecks policy and acknowledges the preceding sync token. Retries of a completed transaction do not enqueue another event. Open accounts can also exchange to-device messages with a configured federation peer. The live room APIs currently admit personal accounts and accounts in explicitly open organisations. `fixtures/policy-cases.json` is the same contract exercised by the Synapse distribution.
 
-For federation, set `PEER_KEYS` to a map from the peer's canonical server name to its verified Ed25519 key IDs and unpadded Base64 public keys. Set `PEER_URLS` to a map from that name to its HTTPS federation origin. The Worker publishes its own signing key at `/_matrix/key/v2/server`. Configure the independent peer to resolve the Worker's canonical name through Matrix delegation. Federation requests sign the method, path, query, destination and JSON body.
+For a fixed reference server, set `PEER_KEYS` and `PEER_URLS` to the trusted verification keys and HTTPS transport endpoint for its canonical name. Set `DISCOVER_PEERS` to true to allow discovery of independent DNS names with an explicit port or an HTTPS delegation to a host and port. The Worker checks the key document's name, signatures and expiry. A changed key set currently needs operator review. Use the `global_fetch_strictly_public` compatibility flag on deployments with public discovery.
 
 ## Room replay
 
@@ -36,6 +36,8 @@ To repeat the walkthrough:
 4. Start a second encrypted room from Synapse. The Worker signs the invite, requests a join template, submits its signed join and verifies the room history before syncing the conversation.
 5. Sign in to Relay on the Worker and repeat with NeoChat. Use a fresh browser profile and the saved recovery key to check restoration.
 
-The deployment supports a bounded v10 room graph of 512 events, up to 32 missing predecessors when joining an existing room, and 1 MiB attachments. The Worker stores encrypted media as client-supplied bytes and serves authenticated Matrix media downloads. Complement's version-response and private-room-creation assertions passed against both servers using a remote deployment adapter.
+A fresh stock Synapse and the Worker discovered each other and exchanged signed joins and messages in rooms created on either server. In a Synapse room with joined-only history and 48 earlier messages, the Worker verified the redacted graph, exposed only the new member's join in client history, and delivered the next message.
 
-General peer discovery and key rotation, recovery of arbitrary gaps after disconnection, distributed restricted-room admission, and the full Complement suite remain cutover work. This deployment is for interoperability testing.
+Linear v10 appends validate against committed room state. A deployed Worker accepted 525 messages in one room. Sync returned the latest 50 and the client paged back through the boundary. Importing an independent room still reconstructs its graph in one operation, with at most 512 PDUs and 32 missing-history fetches. The encrypted media limit is 1 MiB. Complement's version-response and private-room-creation assertions passed against both servers using a remote deployment adapter.
+
+SRV-based discovery, peer signing-key rotation, larger remote joins, gap recovery after disconnection, restricted-room admission and broader Complement coverage remain cutover work.

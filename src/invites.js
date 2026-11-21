@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-import { graphKeys } from './discovery.js';
+import { graphKeys, peerRecord } from './discovery.js';
+import { limited } from './media.js';
 import { verify_signed_pdu } from '../room-v10/pkg/relay_room_v10.js';
 import { RoomGraph, domain, eventId, signPdu } from './graph.js';
 import { openParty, ok, fail, missing, save, receiveEvent } from './rooms.js';
@@ -83,8 +84,10 @@ export async function joinRemote(home, server, user, room, invite) {
   const peer = invite.peer,
     prefix = '/_matrix/federation/',
     rid = encodeURIComponent(room);
-  const request = async (method, path, content) =>
-    (await remote(home, server, peer, method, prefix + path, content)).json();
+  const request = async (method, path, content) => {
+    const response = await remote(home, server, peer, method, prefix + path, content);
+    return JSON.parse(new TextDecoder().decode(await limited(response.body, 4 * 1024 * 1024)));
+  };
   // Save the exact signed join before the first remote write; retries use the same v10 event ID.
   let join = invite.joining && JSON.parse(invite.joining);
   if (!join) {
@@ -149,7 +152,7 @@ export async function joinRemote(home, server, user, room, invite) {
   for (const p of [...response.auth_chain, ...response.state, join]) pool.set(eventId(p), p);
   if (pool.size > 512) fail(503, 'M_RESOURCE_LIMIT_EXCEEDED', 'Peer room exceeds spike limit');
   let fetched = 0;
-  async function visit(id) {
+  async function visit(id, child) {
     if (done.has(id)) return;
     if (visiting.has(id)) fail(502, 'M_BAD_JSON', 'Cyclic remote history');
     visiting.add(id);
@@ -157,20 +160,39 @@ export async function joinRemote(home, server, user, room, invite) {
     if (!p) {
       if (++fetched > 32 || pool.size >= 512)
         fail(503, 'M_RESOURCE_LIMIT_EXCEEDED', 'Peer room exceeds backfill limit');
-      const transaction = await request('GET', 'v1/event/' + encodeURIComponent(id));
-      p = transaction.pdus?.find((e) => eventId(e) === id);
+      if (child?.prev_events.includes(id)) {
+        // Matrix peers may hide old history. Only feed reachable, signed ancestors into room replay.
+        const limit = Math.min(64, 512 - pool.size);
+        const batch = await request('POST', 'v1/get_missing_events/' + rid, {
+          earliest_events: [...done].slice(-10), latest_events: [eventId(child)], limit
+        }).catch(() => null);
+        if (Array.isArray(batch?.events) && batch.events.length <= limit)
+          for (const event of batch.events)
+            if (event.room_id === room && !pool.has(eventId(event))) pool.set(eventId(event), event);
+        p = pool.get(id);
+      }
+      if (!p) {
+        if (pool.size >= 512) fail(503, 'M_RESOURCE_LIMIT_EXCEEDED', 'Peer room exceeds backfill limit');
+        const transaction = await request('GET', 'v1/event/' + encodeURIComponent(id));
+        p = transaction.pdus?.find((e) => eventId(e) === id);
+      }
       if (!p) fail(502, 'M_BAD_JSON', 'Peer did not return the requested predecessor');
       pool.set(id, p);
     }
     if (p.room_id !== room || p.type === 'm.room.server_acl')
       fail(403, 'M_FORBIDDEN', 'Unsupported federated state');
-    for (const prev of [...p.prev_events, ...p.auth_events]) await visit(prev);
+    for (const prev of [...p.prev_events, ...p.auth_events]) await visit(prev, p);
     visiting.delete(id);
     done.add(id);
-    ordered.push(p);
+    const { unsigned, ...signed } = p;
+    ordered.push(signed);
   }
   await visit(eventId(join));
   // Reconstruct the room from signed history. Unsigned invite previews are never promoted to state.
+  const origins = new Set(ordered.map((p) => domain(p.sender)));
+  origins.delete(server);
+  if (origins.size > 32) fail(503, 'M_RESOURCE_LIMIT_EXCEEDED', 'Peer room has too many signing origins');
+  for (const origin of origins) await peerRecord(home, origin);
   const keys = {
     ...graphKeys(home),
     [server]: { 'ed25519:1': home.identity.publicKey }

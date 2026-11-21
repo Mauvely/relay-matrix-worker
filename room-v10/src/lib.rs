@@ -66,10 +66,16 @@ impl Trace {
         ruma_state_res::resolve(&RULES.authorization, RULES.state_res.v2_rules().unwrap(),
             states, chains, |id| self.events.get(id), |_| None).map_err(|e| e.to_string())
     }
-    fn apply(&mut self, obj: CanonicalJsonObject, keys: &PublicKeyMap) -> Result<(),String> {
+    fn apply(&mut self, mut obj: CanonicalJsonObject, keys: &PublicKeyMap) -> Result<(),String> {
+        obj.remove("unsigned");
         ruma_state_res::check_pdu_format(&obj, &RULES.event_format)?;
         if ruma_signatures::verify_event(keys, &obj, &RULES).map_err(|e| e.to_string())? != Verified::All {
-            return Err("trace requires original content, not redacted history".into());
+            // A peer may only disclose a redacted predecessor before our join. Accept its
+            // signed graph and authorization fields only when it is already the exact
+            // room-version redaction. The caller also stores this PDU for later federation.
+            let redacted = ruma_common::canonical_json::redact(obj.clone(), &RULES.redaction, None)
+                .map_err(|e| e.to_string())?;
+            if obj != redacted { return Err("PDU contains unsigned or hash-mismatched content".into()); }
         }
         let hash = ruma_signatures::reference_hash(&obj, &RULES).map_err(|e| e.to_string())?;
         let mut value = serde_json::to_value(obj).map_err(|e| e.to_string())?;
