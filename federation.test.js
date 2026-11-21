@@ -27,3 +27,26 @@ test('federation authenticates the full request URI and intended logical server'
     false
   );
 });
+
+test('signed federation writes bind the body, destination and transaction path', async () => {
+  const { createIdentity } = await import('./src/identity.js');
+  const { sign, authenticatedOrigin } = await import('./src/federation.js');
+  const identity = await createIdentity(),
+    origin = 'synapse.test',
+    destination = 'worker.test',
+    uri = '/_matrix/federation/v1/send/10',
+    content = { origin, pdus: [], edus: [] };
+  const sig = await sign(identity, canonical({ method: 'PUT', uri, origin, destination, content }));
+  const request = new Request('https://matrix.example' + uri, {
+    method: 'PUT',
+    headers: {
+      Authorization: `X-Matrix origin="${origin}",destination="${destination}",key="ed25519:1",sig="${sig}"`
+    }
+  });
+  const peers = { [origin]: { 'ed25519:1': identity.publicKey } };
+  assert.equal(await authenticatedOrigin(request, destination, peers, content), origin);
+  assert.equal(
+    await authenticatedOrigin(request, destination, peers, { ...content, origin: destination }),
+    false
+  );
+});

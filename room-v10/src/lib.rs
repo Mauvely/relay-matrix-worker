@@ -115,3 +115,49 @@ pub fn replay(events: &str, keys: &str) -> Result<String,String> {
     result.sort();
     serde_json::to_string(&result).map_err(|e| e.to_string())
 }
+
+// Use the same v10 rules for producing live events as for verifying received PDUs.
+#[wasm_bindgen]
+pub fn prepare_event(event: &str) -> Result<String,String> {
+    let mut obj: CanonicalJsonObject = serde_json::from_str(event).map_err(|e| e.to_string())?;
+    let digest = ruma_signatures::content_hash(&obj).map_err(|e| e.to_string())?.encode();
+    obj.insert("hashes".into(), CanonicalJsonObject::from([("sha256".into(), digest.clone().into())]).into());
+    let mut redacted = ruma_common::canonical_json::redact(obj, &RULES.redaction, None).map_err(|e| e.to_string())?;
+    redacted.remove("signatures");
+    redacted.remove("unsigned");
+    serde_json::to_string(&(digest,serde_json::to_string(&redacted).map_err(|e| e.to_string())?)).map_err(|e| e.to_string())
+}
+
+#[wasm_bindgen]
+pub fn reference_id(event: &str) -> Result<String,String> {
+    let obj = serde_json::from_str(event).map_err(|e| e.to_string())?;
+    Ok(format!("${}", ruma_signatures::reference_hash(&obj, &RULES).map_err(|e| e.to_string())?))
+}
+
+#[wasm_bindgen]
+pub fn auth_fields(kind: &str, sender: &str, state_key: Option<String>, content: &str) -> Result<String,String> {
+    let sender = UserId::parse(sender).map_err(|e| e.to_string())?;
+    let raw = RawValue::from_string(content.to_owned()).map_err(|e| e.to_string())?;
+    let fields = ruma_state_res::auth_types_for_event(&kind.into(), &sender, state_key.as_deref(), &raw, &RULES.authorization)?;
+    serde_json::to_string(&fields).map_err(|e| e.to_string())
+}
+
+#[wasm_bindgen]
+pub fn check_current(event: &str, state: &str) -> Result<(),String> {
+    let pdu: Pdu = serde_json::from_str(event).map_err(|e| e.to_string())?;
+    let entries: Vec<Pdu> = serde_json::from_str(state).map_err(|e| e.to_string())?;
+    ruma_state_res::check_state_dependent_auth_rules(&RULES.authorization, &pdu, |ty,key| {
+        entries.iter().find(|p| p.kind.to_string() == ty.to_string() && p.state_key.as_deref() == Some(key))
+    })
+}
+
+#[wasm_bindgen]
+pub fn verify_signed_pdu(event: &str, keys: &str) -> Result<(),String> {
+    let event = serde_json::from_str(event).map_err(|e| e.to_string())?;
+    let keys = serde_json::from_str(keys).map_err(|e| e.to_string())?;
+    ruma_state_res::check_pdu_format(&event, &RULES.event_format)?;
+    if ruma_signatures::verify_event(&keys,&event,&RULES).map_err(|e| e.to_string())? != Verified::All {
+        return Err("PDU content hash mismatch".into());
+    }
+    Ok(())
+}

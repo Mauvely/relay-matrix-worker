@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
+import { domain } from './graph.js';
 import { matrixError } from './accounts.js';
 
 export function canShare(a, b, policies) {
@@ -48,6 +49,7 @@ export async function deliver(request, env, server, kind, txn) {
     return matrixError(400, 'M_BAD_JSON', 'Expected bounded device messages');
   const stored = await home.transactionBody(txKey, data.messages);
   const deliveries = [];
+  const remotes = new Map();
   try {
     const from = await lookup(env, device.user_id);
     for (const [user, targets] of Object.entries(stored)) {
@@ -55,11 +57,17 @@ export async function deliver(request, env, server, kind, txn) {
       const to = await lookup(env, user);
       if (!canShare(from, to, env.ORGANISATIONS ?? {}))
         return matrixError(403, 'M_FORBIDDEN', 'The two organisations do not both permit contact');
-      if (!to.managed) return matrixError(503, 'M_UNAVAILABLE', 'Remote device federation is unavailable');
+      if (!to.managed) {
+        const peer = domain(user);
+        if (!env.PEER_URLS?.[peer] || !env.PEER_KEYS?.[peer])
+          return matrixError(503, 'M_UNAVAILABLE', 'Unknown peer');
+        if (!remotes.has(peer)) remotes.set(peer, Object.create(null));
+        remotes.get(peer)[user] = targets;
+      }
       for (const [id, content] of Object.entries(targets)) {
         if (!id || id.length > 255 || !object(content))
           return matrixError(400, 'M_BAD_JSON', 'Invalid device content');
-        deliveries.push({ domain: to.domain, user, id, content });
+        if (to.managed) deliveries.push({ domain: to.domain, user, id, content });
       }
     }
   } catch {
@@ -67,7 +75,7 @@ export async function deliver(request, env, server, kind, txn) {
   }
   for (const { domain, user, id, content } of deliveries)
     await env.HOMESERVERS.getByName(domain).enqueue(txKey, user, id, device.user_id, kind, content);
-  await home.complete(txKey);
+  await home.finishDevice(txKey, server, device.user_id, kind, JSON.parse(JSON.stringify([...remotes])));
   return { status: 200, body: {} };
 }
 
@@ -81,17 +89,42 @@ export async function syncDevices(request, env, server) {
   if (auth.status !== 200) return auth;
   const params = new URL(request.url).searchParams,
     since = params.get('since') ?? 'd0';
-  if (!/^d[0-9]{1,15}$/.test(since)) return matrixError(400, 'M_INVALID_PARAM', 'Invalid sync token');
+  const match = /^d(\d{1,15})(?:r(\d{1,15})a(\d{1,15})(?:k(\d{1,15})(?:i(\d{1,15}))?)?)?$/.exec(since);
+  if (!match) return matrixError(400, 'M_INVALID_PARAM', 'Invalid sync token');
   const { user_id: user, device_id: device } = auth.body;
-  const cursor = Number(since.slice(1));
+  const cursor = Number(match[1]),
+    roomCursor = Number(match[2] ?? 0),
+    accountCursor = Number(match[3] ?? 0);
+  const initial = !params.has('since') || !match[2] || params.get('full_state') === 'true';
   if (params.has('since')) await home.acknowledge(user, device, cursor);
-  let rows = await home.pending(user, device, cursor);
-  if (!rows.length && params.has('since')) {
-    const timeout = Math.min(30000, Math.max(0, Number(params.get('timeout')) || 0));
-    if (timeout > 0) {
-      await home.waitForDevice(user, device, cursor, timeout);
-      rows = await home.pending(user, device, cursor);
+  let rows, room, account, keys, invites;
+  const read = async () => {
+    [invites, keys, rows, room, account] = await Promise.all([
+      home.inviteUpdates(user, Number(match[5] ?? 0), initial),
+      home.cryptoUpdates(user, device, Number(match[4] ?? 0)),
+      home.pending(user, device, cursor),
+      home.roomUpdates(server, user, roomCursor, initial),
+      home.userUpdates(user, accountCursor)
+    ]);
+  };
+  try {
+    await read();
+    if (
+      !initial &&
+      !rows.length &&
+      room.high === roomCursor &&
+      !account.events.length &&
+      !keys.changed.length &&
+      !Object.keys(invites.rooms).length
+    ) {
+      const timeout = Math.min(Number(params.get('timeout')) || 0, 2500);
+      if (timeout > 0) {
+        await home.waitForDevice(user, device, cursor, timeout);
+        await read();
+      }
     }
+  } catch {
+    return matrixError(503, 'M_UNAVAILABLE', 'Room state or organisation policy unavailable');
   }
   const events = [];
   try {
@@ -107,6 +140,24 @@ export async function syncDevices(request, env, server) {
   }
   return {
     status: 200,
-    body: { next_batch: 'd' + (rows.at(-1)?.sequence ?? cursor), to_device: { events } }
+    body: {
+      next_batch:
+        'd' +
+        (rows.at(-1)?.sequence ?? cursor) +
+        'r' +
+        room.high +
+        'a' +
+        account.high +
+        'k' +
+        keys.high +
+        'i' +
+        invites.high,
+      device_one_time_keys_count: keys.counts,
+      device_unused_fallback_key_types: keys.fallback,
+      rooms: { ...room.rooms, invite: { ...room.rooms.invite, ...invites.rooms } },
+      account_data: { events: account.events },
+      device_lists: { changed: [...new Set([...room.changed, ...keys.changed])], left: [] },
+      to_device: { events }
+    }
   };
 }

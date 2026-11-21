@@ -10,9 +10,9 @@ For a delegated name, its web administrator publishes `/.well-known/matrix/clien
 
 Set `PROVISION_TOKEN` with Wrangler. An authenticated operator can POST a JSON object containing `localpart` and `organisation_id` (a stable ID, or null for a personal account) to `/_relay/spike/provision`. Both live discovery documents must match the endpoint before a new ID can be issued. The operator receives a generated high-entropy credential once. The spike exposes password login, device-scoped access tokens, whoami and logout.
 
-For hosted to-device traffic, `ORGANISATIONS` maps stable organisation IDs to a policy of `open`, `closed` or `allowlist`. An allowlisted organisation supplies `allow` with its partner IDs. Both directions must permit communication. A missing policy stops delivery. Each device sync reads its own queue, rechecks policy and acknowledges the preceding sync token. Retries of a completed transaction do not enqueue another event. Cross-domain delivery currently requires both accounts to be hosted on this Worker. `fixtures/policy-cases.json` is the same contract exercised by the Synapse distribution.
+For hosted to-device traffic, `ORGANISATIONS` maps stable organisation IDs to a policy of `open`, `closed` or `allowlist`. An allowlisted organisation supplies `allow` with its partner IDs. Both directions must permit communication. A missing policy stops delivery. Each device sync reads its own queue, rechecks policy and acknowledges the preceding sync token. Retries of a completed transaction do not enqueue another event. Open accounts can also exchange to-device messages with a configured federation peer. The live room APIs currently admit personal accounts and accounts in explicitly open organisations. `fixtures/policy-cases.json` is the same contract exercised by the Synapse distribution.
 
-Federation key discovery is public. A signed federation profile query verifies the complete request URI and intended destination against operator-pinned Ed25519 keys in `PEER_KEYS` (canonical origin → key ID → public key). General remote-key discovery and rotation are pending.
+For federation, set `PEER_KEYS` to a map from the peer's canonical server name to its verified Ed25519 key IDs and unpadded Base64 public keys. Set `PEER_URLS` to a map from that name to its HTTPS federation origin. The Worker publishes its own signing key at `/_matrix/key/v2/server`. Configure the independent peer to resolve the Worker's canonical name through Matrix delegation. Federation requests sign the method, path, query, destination and JSON body.
 
 ## Room replay
 
@@ -24,4 +24,18 @@ Independent Synapse successfully queried a provisioned user's profile over signe
 
 The four catch-up checkpoints contained 9, 11, 128, and 512 signed events. HTTPS wall times for the respective append requests were 241, 127, 217 and 434 ms. The final tenant SQLite database occupied 462,848 bytes, including its other tables. Replaying an old checkpoint returned 409 with the current stored count. Cloudflare reported 0.599 ms median and 4.407 ms p99 Worker CPU across a separate 80-request sample of mixed traffic. This sample does not isolate Durable Object replay CPU. A five-second sampling profile had only 9 ms of samples and gave no function-level replay timing.
 
-The versions endpoint advertises an empty list. Element 1.12.35 requires a supported client version. The room-creation Complement case and an independent Synapse federation join both reached unimplemented routes. Live room creation and replicated joins, room timeline sync, Matrix device-key and backup APIs, and media remain prerequisites for an Element conversation. Keep existing messaging available until that conversation, device verification and recovery work across implementations.
+### Desktop interoperability
+
+On 21 November, Element 1.12.35 used the deployed Worker while Relay used a separately running PostgreSQL-backed Synapse 1.165.0. Each client decrypted the other's message and downloaded an encrypted attachment that matched the original bytes. Their seven SAS emoji matched in order and both clients confirmed verification. NeoChat 26.08.2 and Relay exchanged encrypted messages on the Worker. A fresh Relay device restored a prior encrypted message from a Worker account's key backup.
+
+To repeat the walkthrough:
+
+1. Configure a pinned Synapse peer as described above. Set its default room version to `10` for new conversations it originates. Provision two personal Worker accounts and one Synapse account.
+2. Sign in to Element and NeoChat with the Worker accounts. Sign in to Relay's `/matrix` page with the Synapse account. Use each client's recovery setup before verifying.
+3. Invite the other account to an encrypted conversation. Accept in the other client. Compare all seven SAS emoji, confirm on each device, send a distinct message and download a file in each direction. Compare downloaded bytes with the originals.
+4. Start a second encrypted room from Synapse. The Worker signs the invite, requests a join template, submits its signed join and verifies the room history before syncing the conversation.
+5. Sign in to Relay on the Worker and repeat with NeoChat. Use a fresh browser profile and the saved recovery key to check restoration.
+
+The deployment supports a bounded v10 room graph of 512 events, up to 32 missing predecessors when joining an existing room, and 1 MiB attachments. The Worker stores encrypted media as client-supplied bytes and serves authenticated Matrix media downloads. Complement's version-response and private-room-creation assertions passed against both servers using a remote deployment adapter.
+
+General peer discovery and key rotation, recovery of arbitrary gaps after disconnection, distributed restricted-room admission, and the full Complement suite remain cutover work. This deployment is for interoperability testing.

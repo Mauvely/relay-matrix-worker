@@ -1,9 +1,25 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// The documents signed here contain only ASCII keys and exact integers.
+// Matrix canonical JSON sorts Unicode keys by scalar value.
+function compareKeys(a, b) {
+  const left = Array.from(a),
+    right = Array.from(b);
+  for (let i = 0; i < Math.min(left.length, right.length); i++) {
+    const difference = left[i].codePointAt(0) - right[i].codePointAt(0);
+    if (difference) return difference;
+  }
+  return left.length - right.length;
+}
 export function canonical(value) {
   if (Array.isArray(value)) return '[' + value.map(canonical).join(',') + ']';
   if (value !== null && typeof value === 'object') {
-    return '{' + Object.keys(value).sort().map(key => JSON.stringify(key) + ':' + canonical(value[key])).join(',') + '}';
+    return (
+      '{' +
+      Object.keys(value)
+        .sort(compareKeys)
+        .map((key) => JSON.stringify(key) + ':' + canonical(value[key]))
+        .join(',') +
+      '}'
+    );
   }
   return JSON.stringify(value);
 }
@@ -29,6 +45,10 @@ export async function signServerKeys(serverName, identity, now = Date.now()) {
     old_verify_keys: {}
   };
   const privateKey = await crypto.subtle.importKey('jwk', identity.privateKey, 'Ed25519', false, ['sign']);
-  const signature = await crypto.subtle.sign('Ed25519', privateKey, new TextEncoder().encode(canonical(body)));
+  const signature = await crypto.subtle.sign(
+    'Ed25519',
+    privateKey,
+    new TextEncoder().encode(canonical(body))
+  );
   return { ...body, signatures: { [serverName]: { [id]: base64(signature) } } };
 }

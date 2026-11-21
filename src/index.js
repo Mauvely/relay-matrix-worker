@@ -1,6 +1,14 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 import { deliver, syncDevices } from './device.js';
-import { authenticateQuery } from './federation.js';
+import module from '../room-v10/pkg/relay_room_v10_bg.wasm';
+import { initSync } from '../room-v10/pkg/relay_room_v10.js';
+import { inviteSchema, joinRemote, remoteInvites } from './invites.js';
+import { backupSchema } from './backup.js';
+import { keySchema, keyCounts, sharedUsers } from './keys.js';
+import { clientApi, federationApi } from './api.js';
+import { getRemote, limited, mediaSchema, mediaRoute } from './media.js';
+import { openParty, queue, schema, roomSync } from './rooms.js';
+import { authenticatedOrigin, remote, authenticateQuery } from './federation.js';
 import { delegated, login, provision, session } from './accounts.js';
 import { replayProbe, verifyFixtureHistory } from './probe.js';
 import { DurableObject } from 'cloudflare:workers';
@@ -9,11 +17,17 @@ import { createIdentity, signServerKeys } from './identity.js';
 export class Homeserver extends DurableObject {
   constructor(ctx, env) {
     super(ctx, env);
+    initSync({ module });
     this.waiters = new Map();
     this.sql = ctx.storage.sql;
     this.sql.exec(
       'CREATE TABLE IF NOT EXISTS devices (user TEXT, device TEXT, PRIMARY KEY(user,device)); CREATE TABLE IF NOT EXISTS delivery (sequence INTEGER PRIMARY KEY AUTOINCREMENT, txn TEXT, user TEXT, device TEXT, sender TEXT, kind TEXT, content TEXT, UNIQUE(txn,user,device)); CREATE INDEX IF NOT EXISTS delivery_device ON delivery(user,device,sequence)'
     );
+    schema(this.sql);
+    inviteSchema(this.sql);
+    keySchema(this.sql);
+    backupSchema(this.sql);
+    mediaSchema(this.sql);
     ctx.blockConcurrencyWhile(async () => {
       this.identity = await ctx.storage.get('ed25519:1');
       if (!this.identity) {
@@ -21,6 +35,127 @@ export class Homeserver extends DurableObject {
         await ctx.storage.put('ed25519:1', this.identity);
       }
     });
+  }
+
+  async api(server, auth, peer, method, parts, query, body) {
+    const joining =
+      !peer && method === 'POST' && (parts[0] === 'join' || (parts[0] === 'rooms' && parts[2] === 'join'));
+    const invite =
+      joining &&
+      this.sql
+        .exec(
+          'SELECT peer,signed,joining FROM remote_invites WHERE user=? AND room=?',
+          auth.user_id,
+          parts[1]
+        )
+        .toArray()[0];
+    const run = async () => {
+      try {
+        if (invite) return await joinRemote(this, server, auth.user_id, parts[1], invite);
+        const args = [this, server, peer || auth, method, parts, new URLSearchParams(query), body];
+        return peer ? await federationApi(...args) : await clientApi(...args);
+      } catch (e) {
+        return {
+          status: e.status ?? 400,
+          body: { errcode: e.errcode ?? 'M_BAD_JSON', error: e.message ?? String(e) }
+        };
+      }
+    };
+    // Peers may call back for our signing key while answering a join or key query.
+    const callsPeer = invite || (!peer && parts[0] === 'keys' && ['claim', 'query'].includes(parts[1]));
+    const result = callsPeer ? await run() : await this.ctx.blockConcurrencyWhile(run);
+    if (
+      this.sql.exec('SELECT 1 FROM outbound LIMIT 1').toArray().length &&
+      (await this.ctx.storage.getAlarm()) === null
+    )
+      await this.ctx.storage.setAlarm(Date.now() + 20);
+    return JSON.parse(JSON.stringify(result));
+  }
+  async mediaAllowed(server, user) {
+    try {
+      await openParty(this, server, user);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+  mediaRead(id) {
+    return this.sql.exec('SELECT body,type FROM media WHERE id=?', id).toArray()[0] ?? null;
+  }
+  mediaWrite(buffer, type) {
+    const id = crypto.randomUUID();
+    this.sql.exec('INSERT INTO media VALUES(?,?,?)', id, buffer, type);
+    return id;
+  }
+  async mediaRemote(server, peer, id) {
+    return getRemote(this, server, peer, id);
+  }
+  async alarm() {
+    const sql = this.sql;
+    const ready = sql
+      .exec(
+        'SELECT o.*,COALESCE(r.attempt,0) AS attempt FROM outbound o LEFT JOIN retry r ON o.id=r.id WHERE COALESCE(r.due,0)<=? AND NOT EXISTS (SELECT 1 FROM outbound earlier WHERE earlier.peer=o.peer AND earlier.rowid<o.rowid) ORDER BY o.rowid LIMIT 8',
+        Date.now()
+      )
+      .toArray();
+    for (const r of ready) {
+      try {
+        const content = JSON.parse(r.content),
+          people = new Set();
+        for (const event of content.pdus ?? (content.event ? [content.event] : [])) {
+          const members = sql.exec(
+            "SELECT s.skey FROM room_state s JOIN room_events e ON e.eid=s.eid WHERE s.room=? AND kind='m.room.member' AND json_extract(e.pdu,'$.content.membership') IN ('join','invite')",
+            event.room_id
+          );
+          for (const m of members) people.add(m.skey);
+          people.add(event.sender);
+        }
+        for (const edu of content.edus ?? []) people.add(edu.content.sender ?? edu.content.user_id);
+        for (const user of people) await openParty(this, r.server, user);
+        const response = await remote(this, r.server, r.peer, 'PUT', r.path, content);
+        const body = await response.json();
+        if (Object.values(body.pdus ?? {}).some((p) => p.error)) throw Error('Peer rejected room event');
+        this.ctx.storage.transactionSync(() => {
+          sql.exec('DELETE FROM outbound WHERE id=?', r.id);
+          sql.exec('DELETE FROM retry WHERE id=?', r.id);
+        });
+      } catch (e) {
+        const delay = Math.min(300000, 2000 * 2 ** Math.min(8, r.attempt));
+        sql.exec('INSERT OR REPLACE INTO retry VALUES(?,?,?)', r.id, r.attempt + 1, Date.now() + delay);
+        console.warn('Federation delivery pending', r.peer, e.message);
+      }
+    }
+    const next = sql
+      .exec(
+        'SELECT MIN(COALESCE(r.due,0)) AS due FROM outbound o LEFT JOIN retry r ON o.id=r.id WHERE NOT EXISTS (SELECT 1 FROM outbound earlier WHERE earlier.peer=o.peer AND earlier.rowid<o.rowid)'
+      )
+      .one().due;
+    if (next !== null) await this.ctx.storage.setAlarm(Math.max(Date.now() + 10, next));
+  }
+  async roomUpdates(server, user, cursor, initial) {
+    return roomSync(this, server, user, cursor, initial);
+  }
+  cryptoUpdates(user, device, cursor) {
+    const shared = sharedUsers(this, user);
+    const high = this.sql.exec('SELECT COALESCE(MAX(seq),0) AS n FROM key_changes').one().n;
+    const changed = this.sql
+      .exec('SELECT DISTINCT user FROM key_changes WHERE seq>?', cursor)
+      .toArray()
+      .map((r) => r.user)
+      .filter((u) => shared.has(u));
+    return { ...keyCounts(this, user, device), high, changed };
+  }
+  inviteUpdates(user, cursor, initial) {
+    return remoteInvites(this, user, cursor, initial);
+  }
+  userUpdates(user, cursor) {
+    const rows = this.sql
+      .exec('SELECT * FROM user_data WHERE user=? AND seq>? ORDER BY seq', user, cursor)
+      .toArray();
+    return {
+      high: rows.at(-1)?.seq ?? cursor,
+      events: rows.map((r) => ({ type: r.kind, content: JSON.parse(r.content) }))
+    };
   }
 
   async provision(server, localpart, organisationId) {
@@ -56,6 +191,28 @@ export class Homeserver extends DurableObject {
       await t.put(key, proposed);
       return proposed;
     });
+  }
+  async finishDevice(txKey, server, sender, kind, remotes) {
+    const id = 'device/' + txKey;
+    this.ctx.storage.transactionSync(() => {
+      if (this.sql.exec('SELECT id FROM received WHERE id=?', id).toArray().length) return;
+      for (const [peer, messages] of remotes)
+        queue(
+          this,
+          server,
+          peer,
+          [],
+          [
+            {
+              edu_type: 'm.direct_to_device',
+              content: { sender, type: kind, message_id: crypto.randomUUID(), messages }
+            }
+          ]
+        );
+      this.sql.exec('INSERT INTO received VALUES(?,?)', id, '{}');
+    });
+    if (remotes.length) await this.ctx.storage.setAlarm(Date.now() + 25);
+    await this.complete(txKey);
   }
   async complete(txKey) {
     await this.ctx.storage.transaction(async (t) => {
@@ -162,7 +319,7 @@ function json(body, status = 200) {
     headers: {
       'Access-Control-Allow-Origin': '*',
       'Access-Control-Allow-Headers': 'Authorization, Content-Type',
-      'Access-Control-Allow-Methods': 'GET, POST, PUT, OPTIONS',
+      'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
       'Cache-Control': 'no-store'
     }
   });
@@ -195,6 +352,13 @@ export default {
       const result = await homeserver.catchup(data);
       return json(result.body, result.status);
     }
+    if (
+      pathname === '/_matrix/client/v1/auth_metadata' ||
+      pathname.startsWith('/_matrix/client/unstable/org.matrix.msc3814.v1/')
+    )
+      return json({ errcode: 'M_UNRECOGNIZED', error: 'Unsupported endpoint' }, 404);
+    const media = await mediaRoute(request, env, server, homeserver, pathname, json);
+    if (media) return media;
     const devicePath = /^\/_matrix\/client\/(?:v3|r0)\/sendToDevice\/([^/]+)\/([^/]+)$/.exec(pathname);
     if (devicePath && request.method === 'PUT') {
       let kind, txn;
@@ -281,8 +445,48 @@ export default {
       }
       if (pathname === '/_matrix/federation/v1/version')
         return json({ server: { name: 'Mauvely Relay spike', version: '0.1.0' } });
-      // Discovery is available before a complete client-server version can be advertised.
-      if (pathname === '/_matrix/client/versions') return json({ versions: [], unstable_features: {} });
+      // Clients use these API generations for login and authenticated media.
+      if (pathname === '/_matrix/client/versions')
+        return json({
+          versions: ['v1.1', 'v1.11'],
+          unstable_features: { 'com.mauvely.interop_spike': true }
+        });
+    }
+    const path = /^\/_matrix\/(client|federation)\/(?:v[123]|r0|unstable)\/(.+)$/.exec(pathname);
+    if (path) {
+      const federation = path[1] === 'federation';
+      const auth = federation ? null : await homeserver.session(request.headers.get('Authorization'), false);
+      if (auth && auth.status !== 200) return json(auth.body, auth.status);
+      let parts, body;
+      try {
+        parts = path[2].split('/').map(decodeURIComponent);
+        if (['POST', 'PUT'].includes(request.method)) {
+          let bytes;
+          try {
+            bytes = await limited(request.body, 1024 * 1024);
+          } catch {
+            return json({ errcode: 'M_TOO_LARGE', error: 'Request exceeds spike limit' }, 413);
+          }
+          const raw = new TextDecoder().decode(bytes);
+          body = JSON.parse(raw || '{}');
+          if (!body || typeof body !== 'object' || Array.isArray(body)) throw Error();
+        }
+      } catch {
+        return json({ errcode: 'M_BAD_JSON', error: 'Invalid request' }, 400);
+      }
+      const peer = federation ? await authenticatedOrigin(request, server, env.PEER_KEYS ?? {}, body) : null;
+      if (federation && !peer)
+        return json({ errcode: 'M_UNAUTHORIZED', error: 'Invalid federation signature' }, 401);
+      const result = await homeserver.api(
+        server,
+        auth?.body,
+        peer,
+        request.method,
+        parts,
+        new URL(request.url).search,
+        body
+      );
+      return json(result.body, result.status);
     }
     return json({ errcode: 'M_UNRECOGNIZED', error: 'Unsupported endpoint' }, 404);
   }
