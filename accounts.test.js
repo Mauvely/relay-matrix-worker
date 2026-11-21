@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { delegated, login, provision, session } from './src/accounts.js';
+import { delegated, ensureManagedAccount, login, provision, session } from './src/accounts.js';
 
 function store() {
   const data = new Map();
@@ -51,4 +51,16 @@ test('both delegated records must identify the preassigned endpoint', async () =
     await delegated('a.example', 'hs.example', mock('https://hs.example', 'other.example:443')),
     false
   );
+});
+
+test('directory retries retain the account owner and immutable Matrix ID', async () => {
+  const db = store();
+  const ensure = (owner, local) => ensureManagedAccount(db, 'testing.example', owner, local, null);
+  assert.equal(await ensure('usr_1', 'alex'), '@alex:testing.example');
+  assert.equal(await ensure('usr_1', 'alex'), '@alex:testing.example');
+  await assert.rejects(ensure('usr_2', 'alex'));
+  await assert.rejects(ensure('usr_1', 'different'));
+  assert.equal(db.get('account/alex').passwordHash, undefined);
+  await provision(db, 'testing.example', 'existing', null);
+  await assert.rejects(ensure('usr_3', 'existing'));
 });

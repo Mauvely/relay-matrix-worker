@@ -92,3 +92,23 @@ export async function session(storage, authorization, logout = false) {
   if (logout) await storage.delete(key);
   return { status: 200, body: logout ? {} : { user_id: value.user_id, device_id: value.device_id } };
 }
+
+// Called exclusively through the accounts service binding. No reusable password is created.
+export async function ensureManagedAccount(storage, server, accountId, localpart, organisationId) {
+  if (typeof accountId !== 'string' || !accountId.startsWith('usr_') || accountId.length > 128 ||
+      typeof localpart !== 'string' || !alphabet.test(localpart) ||
+      !(organisationId === null || (typeof organisationId === 'string' && organisationId.length > 0)))
+    throw Error('Invalid account identity');
+  const userId = '@' + localpart + ':' + server;
+  return storage.transaction(async (txn) => {
+    const key = 'account/' + localpart;
+    const ownerKey = 'mauvely-id/' + accountId;
+    const prior = await txn.get(key);
+    const existing = await txn.get(ownerKey);
+    if ((prior && prior.accountId !== accountId) || (existing && existing !== userId))
+      throw Error('Matrix identity already claimed');
+    await txn.put(key, { ...prior, userId, accountId, organisationId });
+    await txn.put(ownerKey, userId);
+    return userId;
+  });
+}
