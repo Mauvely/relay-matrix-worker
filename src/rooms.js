@@ -16,6 +16,7 @@ export function schema(sql) {
   sql.exec(`CREATE TABLE IF NOT EXISTS room_events(seq INTEGER PRIMARY KEY AUTOINCREMENT,room TEXT,eid TEXT UNIQUE,pdu TEXT);
     CREATE INDEX IF NOT EXISTS room_history ON room_events(room,seq);
     CREATE TABLE IF NOT EXISTS room_state(room TEXT,kind TEXT,skey TEXT,eid TEXT,PRIMARY KEY(room,kind,skey));
+    CREATE TABLE IF NOT EXISTS room_checkpoints(room TEXT,first_seq INTEGER,last_seq INTEGER,state TEXT,PRIMARY KEY(room,last_seq));
     CREATE TABLE IF NOT EXISTS room_tips(room TEXT,eid TEXT,PRIMARY KEY(room,eid));
     CREATE TABLE IF NOT EXISTS room_tx(id TEXT PRIMARY KEY,eid TEXT);
     CREATE TABLE IF NOT EXISTS outbound(id TEXT PRIMARY KEY,server TEXT,peer TEXT,path TEXT,content TEXT);
@@ -63,16 +64,26 @@ async function checkParties(home, server, g) {
     if (['join', 'invite'].includes(e.content.membership)) await openParty(home, server, e.state_key);
 }
 export function save(home, g, pdus) {
-  for (const p of pdus)
-    home.sql.exec(
-      'INSERT OR IGNORE INTO room_events(room,eid,pdu) VALUES(?,?,?)',
+  let firstInserted;
+  let lastInserted;
+  for (const p of pdus) {
+    const row = home.sql.exec(
+      'INSERT OR IGNORE INTO room_events(room,eid,pdu) VALUES(?,?,?) RETURNING seq',
       g.room,
       eventId(p),
       JSON.stringify(p)
-    );
+    ).toArray()[0];
+    if (row) {
+      firstInserted ??= row.seq;
+      lastInserted = row.seq;
+    }
+  }
   home.sql.exec('DELETE FROM room_tips WHERE room=?', g.room);
   for (const tip of g.tips) home.sql.exec('INSERT INTO room_tips VALUES(?,?)', g.room, tip);
   if (g.unchangedState) return;
+  if (lastInserted !== undefined)
+    home.sql.exec('INSERT INTO room_checkpoints VALUES(?,?,?,?)', g.room, firstInserted, lastInserted,
+      JSON.stringify([...g.state.values()]));
   home.sql.exec('DELETE FROM room_state WHERE room=?', g.room);
   for (const [key, id] of g.state)
     home.sql.exec('INSERT INTO room_state VALUES(?,?,?,?)', g.room, ...JSON.parse(key), id);
@@ -430,6 +441,23 @@ export async function receiveEvent(home, server, peer, pdu) {
   g.add(pdu);
   commit(home, server, g, [pdu]);
 }
+// The timeline is in local stream order. Its starting state must reflect all branches
+// already committed at that point, including when an older device missed a fork.
+function stateBeforeStream(home, server, room, firstSeq) {
+  const checkpoint = home.sql.exec(
+    'SELECT last_seq,state FROM room_checkpoints WHERE room=? AND first_seq<? ORDER BY last_seq DESC LIMIT 1',
+    room, firstSeq
+  ).toArray()[0];
+  if (checkpoint && checkpoint.last_seq < firstSeq) {
+    const store = new StoredEvents(home.sql, room);
+    return JSON.parse(checkpoint.state).map((id) => clientEvent(store.get(id), id));
+  }
+  // Older rooms lack checkpoints. A sync may also start inside an imported multi-event batch.
+  const prior = home.sql.exec('SELECT eid,pdu FROM room_events WHERE room=? AND seq<? ORDER BY seq', room, firstSeq).toArray();
+  const keys = { ...graphKeys(home), [server]: { 'ed25519:1': home.identity.publicKey } };
+  const prefix = new RoomGraph(room, keys, prior);
+  return [...prefix.state.values()].map((id) => clientEvent(prefix.events.get(id), id));
+}
 export async function roomSync(home, server, user, cursor, initial) {
   const high = home.sql.exec('SELECT COALESCE(MAX(seq),0) AS n FROM room_events').one().n;
   const rooms = { join: {}, invite: {}, leave: {} },
@@ -485,24 +513,33 @@ export async function roomSync(home, server, user, cursor, initial) {
       const joinedNow = initial || sinceJoin > cursor;
       const rows = home.sql
         .exec(
-          'SELECT seq,pdu,eid FROM room_events WHERE room=? AND seq>=? ORDER BY seq',
+          'SELECT seq,pdu,eid FROM room_events WHERE room=? AND seq>=? ORDER BY seq DESC LIMIT 51',
           row.room,
           Math.max(sinceJoin, cursor + 1)
         )
         .toArray();
+      const limited = rows.length > 50;
+      if (limited) rows.pop();
+      rows.reverse();
       const events = rows.map((r) => clientEvent(JSON.parse(r.pdu), r.eid));
-      const timelineIds = new Set(rows.map((row) => row.eid));
-      const state = joinedNow ? stateEvents.filter((e) => !timelineIds.has(e.event_id)) : [];
+      const state = (joinedNow || limited) && rows.length ? stateBeforeStream(home, server, row.room, rows[0].seq) : [];
       rooms.join[row.room] = {
         state: { events: state },
         timeline: {
           events,
-          limited: false,
+          limited,
           ...(rows.length ? { prev_batch: pageToken(row.room, rows[0].seq) } : {})
         },
         ephemeral: { events: [] },
         account_data: { events: [] }
       };
+      if (limited && !joinedNow) {
+        const skipped = home.sql.exec(
+          "SELECT DISTINCT json_extract(pdu,'$.state_key') AS member FROM room_events WHERE room=? AND seq>? AND seq<? AND json_extract(pdu,'$.type')='m.room.member'",
+          row.room, cursor, rows[0].seq
+        ).toArray();
+        for (const m of skipped) changed.add(m.member);
+      }
       for (const m of joinedNow
         ? members.filter((m) => m.content.membership === 'join')
         : events.filter((e) => e.type === 'm.room.member'))

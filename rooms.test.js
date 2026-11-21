@@ -109,7 +109,16 @@ test('linear rooms grow beyond 512 events without replaying every prior message'
   assert.equal(last.status, 200);
   assert.equal(historyReads,baseline);
   const sync = await roomSync(home,server,user,0,true);
-  assert.equal(sync.rooms.join[room].timeline.events.at(-1).event_id,last.body.event_id);
+  const joined = sync.rooms.join[room];
+  assert.equal(joined.timeline.events.at(-1).event_id,last.body.event_id);
+  assert.equal(joined.timeline.limited, true);
+  assert.equal(joined.timeline.events.length, 50);
+  assert.equal(joined.timeline.events[0].content.body, '470');
+  assert.ok(joined.state.events.some((e) => e.type === 'm.room.member' && e.state_key === user));
+  const earlier = await roomClient(home,server,auth,'GET',[room,'messages'],undefined,
+    new URLSearchParams({dir:'b',from:joined.timeline.prev_batch,limit:'1'}));
+  assert.equal(earlier.body.chunk[0].content.body,'469');
+  assert.equal(historyReads,baseline);
   const page = await roomClient(home,server,auth,'GET',[room,'messages'],undefined,new URLSearchParams({dir:'b',limit:'100'}));
   assert.equal(page.body.chunk.length,100);
   assert.ok(page.body.end);

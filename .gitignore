@@ -2,5 +2,6 @@ node_modules/
 .wrangler/
 .dev.vars*
 wrangler.local.json
+wrangler.*.local.json
 target/
 /room-v10/pkg/
