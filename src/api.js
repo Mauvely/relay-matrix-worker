@@ -32,7 +32,23 @@ export async function clientApi(home, server, auth, method, parts, params, body)
       }
     });
   if (parts[0] === 'thirdparty' && parts[1] === 'protocols' && method === 'GET') return ok({});
-  if (parts[0] === 'voip' && parts[1] === 'turnServer' && method === 'GET') return ok({ uris: [] });
+  if (parts[0] === 'voip' && parts[1] === 'turnServer' && method === 'GET') {
+    if (!home.env.TURN_PROVIDER) return ok({uris:[]});
+    await openParty(home,server,user);
+    const cacheKey = 'turn/' + user;
+    const cached = await home.ctx.storage.get(cacheKey);
+    const now = Math.floor(Date.now()/1000);
+    if (cached && cached.expires > now+300) return ok({...cached.answer, ttl:cached.expires-now});
+    try {
+      const answer = await home.env.TURN_PROVIDER.credentials();
+      if (!answer.uris?.length || !answer.username || !answer.password || !(answer.ttl > 0))
+        throw Error('No relay credentials');
+      await home.ctx.storage.put(cacheKey,{answer, expires:now+answer.ttl});
+      return ok(answer);
+    } catch {
+      fail(503,'M_UNAVAILABLE','Call relay temporarily unavailable');
+    }
+  }
   if (parts[0] === 'keys' && method === 'POST')
     return clientKeys(home, server, auth, parts.slice(1).join('/'), body);
   if (parts[0] === 'devices' && method === 'GET') {

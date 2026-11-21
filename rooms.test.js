@@ -199,3 +199,18 @@ test('ACLs use the server hostname, prefer deny rules and support case-insensiti
   }
   assert.throws(() => requireRoomAccess({content:{}},'chat.example'));
 });
+
+test('Matrix TURN credentials are scoped to the authenticated account and reused until refresh', async () => {
+  const {clientApi} = await import('./src/api.js');
+  const storage = new Map();
+  let issued = 0;
+  const home = {env:{TURN_PROVIDER:{credentials:async () => ({
+    uris:['turns:relay.test:443'],username:'temporary'+(++issued),password:'ephemeral',ttl:7200
+  })}}, party:async () => ({organisationId:null}),ctx:{storage:{get:key=>storage.get(key),put:(key,v)=>storage.set(key,v)}}};
+  const get = user => clientApi(home,'worker.test',{user_id:user},'GET',['voip','turnServer'],new URLSearchParams());
+  const first = await get('@a:worker.test');
+  assert.equal((await get('@a:worker.test')).body.username,first.body.username);
+  assert.notEqual((await get('@b:worker.test')).body.username,first.body.username);
+  home.party = async () => ({organisationId:'restricted'});
+  await assert.rejects(get('@a:worker.test'),e=>e.status===403);
+});
