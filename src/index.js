@@ -1,18 +1,28 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-import { deliver, syncDevices } from './device.js';
-import module from '../room-v10/pkg/relay_room_v10_bg.wasm';
-import { initSync } from '../room-v10/pkg/relay_room_v10.js';
-import { inviteSchema, joinRemote, remoteInvites } from './invites.js';
-import { backupSchema } from './backup.js';
-import { announceJoinedDevices, keySchema, keyCounts, sharedUsers } from './keys.js';
-import { clientApi, federationApi } from './api.js';
-import { getRemote, limited, mediaSchema, mediaRoute } from './media.js';
-import { openParty, queue, schema, roomSync } from './rooms.js';
-import { authenticatedOrigin, remote, authenticateQuery } from './federation.js';
-import { delegated, login, provision, session } from './accounts.js';
-import { replayProbe, verifyFixtureHistory } from './probe.js';
-import { DurableObject } from 'cloudflare:workers';
-import { createIdentity, signServerKeys } from './identity.js';
+import { deliver, syncDevices } from "./device.js";
+import module from "../room-v10/pkg/relay_room_v10_bg.wasm";
+import { initSync } from "../room-v10/pkg/relay_room_v10.js";
+import { inviteSchema, joinRemote, remoteInvites } from "./invites.js";
+import { backupSchema } from "./backup.js";
+import {
+  announceJoinedDevices,
+  keySchema,
+  keyCounts,
+  sharedUsers,
+} from "./keys.js";
+import { clientApi, federationApi } from "./api.js";
+import { getRemote, limited, mediaSchema, mediaRoute } from "./media.js";
+import { openParty, queue, schema, roomSync } from "./rooms.js";
+import {
+  authenticatedOrigin,
+  remote,
+  authenticateQuery,
+} from "./federation.js";
+import { delegated, login, provision, session } from "./accounts.js";
+import { replayProbe, verifyFixtureHistory } from "./probe.js";
+import { DurableObject } from "cloudflare:workers";
+import { discoverPeer } from "./discovery.js";
+import { canonical, createIdentity, signServerKeys } from "./identity.js";
 
 export class Homeserver extends DurableObject {
   constructor(ctx, env) {
@@ -21,53 +31,115 @@ export class Homeserver extends DurableObject {
     this.waiters = new Map();
     this.sql = ctx.storage.sql;
     this.sql.exec(
-      'CREATE TABLE IF NOT EXISTS devices (user TEXT, device TEXT, PRIMARY KEY(user,device)); CREATE TABLE IF NOT EXISTS delivery (sequence INTEGER PRIMARY KEY AUTOINCREMENT, txn TEXT, user TEXT, device TEXT, sender TEXT, kind TEXT, content TEXT, UNIQUE(txn,user,device)); CREATE INDEX IF NOT EXISTS delivery_device ON delivery(user,device,sequence)'
+      "CREATE TABLE IF NOT EXISTS devices (user TEXT, device TEXT, PRIMARY KEY(user,device)); CREATE TABLE IF NOT EXISTS delivery (sequence INTEGER PRIMARY KEY AUTOINCREMENT, txn TEXT, user TEXT, device TEXT, sender TEXT, kind TEXT, content TEXT, UNIQUE(txn,user,device)); CREATE INDEX IF NOT EXISTS delivery_device ON delivery(user,device,sequence)",
     );
+    this.sql.exec(
+      "CREATE TABLE IF NOT EXISTS federation_peers(name TEXT PRIMARY KEY, record TEXT NOT NULL)",
+    );
+    this.discoveredKeys = Object.create(null);
+    for (const row of this.sql
+      .exec("SELECT name,record FROM federation_peers")
+      .toArray())
+      this.discoveredKeys[row.name] = JSON.parse(row.record).keys;
     schema(this.sql);
     inviteSchema(this.sql);
     keySchema(this.sql);
     backupSchema(this.sql);
     mediaSchema(this.sql);
     ctx.blockConcurrencyWhile(async () => {
-      this.identity = await ctx.storage.get('ed25519:1');
+      this.identity = await ctx.storage.get("ed25519:1");
       if (!this.identity) {
         this.identity = await createIdentity();
-        await ctx.storage.put('ed25519:1', this.identity);
+        await ctx.storage.put("ed25519:1", this.identity);
       }
     });
   }
 
+  async resolvePeer(name) {
+    if (
+      Object.hasOwn(this.env.PEER_KEYS ?? {}, name) &&
+      Object.hasOwn(this.env.PEER_URLS ?? {}, name)
+    )
+      return {
+        keys: this.env.PEER_KEYS[name],
+        endpoint: this.env.PEER_URLS[name],
+      };
+    if (!this.env.DISCOVER_PEERS)
+      throw Error("Federation discovery is disabled");
+    const row = this.sql
+      .exec("SELECT record FROM federation_peers WHERE name=?", name)
+      .toArray()[0];
+    const cached = row && JSON.parse(row.record);
+    if (cached?.expires > Date.now()) return cached;
+    const fresh = await discoverPeer(name);
+    // Persist only a stable key set until replay has event-time key validity information.
+    const known = this.discoveredKeys[name];
+    if (known && canonical(known) !== canonical(fresh.keys))
+      throw Error("Peer signing keys changed");
+    this.sql.exec(
+      "INSERT OR REPLACE INTO federation_peers VALUES(?,?)",
+      name,
+      JSON.stringify(fresh),
+    );
+    this.discoveredKeys[name] = fresh.keys;
+    return fresh;
+  }
+
   async api(server, auth, peer, method, parts, query, body) {
     const joining =
-      !peer && method === 'POST' && (parts[0] === 'join' || (parts[0] === 'rooms' && parts[2] === 'join'));
+      !peer &&
+      method === "POST" &&
+      (parts[0] === "join" || (parts[0] === "rooms" && parts[2] === "join"));
     const invite =
       joining &&
       this.sql
         .exec(
-          'SELECT peer,signed,joining FROM remote_invites WHERE user=? AND room=?',
+          "SELECT peer,signed,joining FROM remote_invites WHERE user=? AND room=?",
           auth.user_id,
-          parts[1]
+          parts[1],
         )
         .toArray()[0];
     const run = async () => {
       try {
-        if (invite) return await joinRemote(this, server, auth.user_id, parts[1], invite);
-        const args = [this, server, peer || auth, method, parts, new URLSearchParams(query), body];
+        if (invite)
+          return await joinRemote(this, server, auth.user_id, parts[1], invite);
+        const args = [
+          this,
+          server,
+          peer || auth,
+          method,
+          parts,
+          new URLSearchParams(query),
+          body,
+        ];
         return peer ? await federationApi(...args) : await clientApi(...args);
       } catch (e) {
         return {
           status: e.status ?? 400,
-          body: { errcode: e.errcode ?? 'M_BAD_JSON', error: e.message ?? String(e) }
+          body: {
+            errcode: e.errcode ?? "M_BAD_JSON",
+            error: e.message ?? String(e),
+          },
         };
       }
     };
     // Peers may call back for our signing key while answering a join or key query.
-    const callsPeer = invite || (!peer && parts[0] === 'keys' && ['claim', 'query'].includes(parts[1]));
-    const result = callsPeer ? await run() : await this.ctx.blockConcurrencyWhile(run);
-    if (result.status === 200 && (joining || (peer && parts[0] === 'send_join')))
-      this.ctx.storage.transactionSync(() => announceJoinedDevices(this, server, parts[1]));
+    const callsPeer =
+      invite ||
+      (!peer && parts[0] === "profile") ||
+      (!peer && parts[0] === "keys" && ["claim", "query"].includes(parts[1]));
+    const result = callsPeer
+      ? await run()
+      : await this.ctx.blockConcurrencyWhile(run);
     if (
-      this.sql.exec('SELECT 1 FROM outbound LIMIT 1').toArray().length &&
+      result.status === 200 &&
+      (joining || (peer && parts[0] === "send_join"))
+    )
+      this.ctx.storage.transactionSync(() =>
+        announceJoinedDevices(this, server, parts[1]),
+      );
+    if (
+      this.sql.exec("SELECT 1 FROM outbound LIMIT 1").toArray().length &&
       (await this.ctx.storage.getAlarm()) === null
     )
       await this.ctx.storage.setAlarm(Date.now() + 20);
@@ -82,11 +154,15 @@ export class Homeserver extends DurableObject {
     }
   }
   mediaRead(id) {
-    return this.sql.exec('SELECT body,type FROM media WHERE id=?', id).toArray()[0] ?? null;
+    return (
+      this.sql
+        .exec("SELECT body,type FROM media WHERE id=?", id)
+        .toArray()[0] ?? null
+    );
   }
   mediaWrite(buffer, type) {
     const id = crypto.randomUUID();
-    this.sql.exec('INSERT INTO media VALUES(?,?,?)', id, buffer, type);
+    this.sql.exec("INSERT INTO media VALUES(?,?,?)", id, buffer, type);
     return id;
   }
   async mediaRemote(server, peer, id) {
@@ -96,52 +172,70 @@ export class Homeserver extends DurableObject {
     const sql = this.sql;
     const ready = sql
       .exec(
-        'SELECT o.*,COALESCE(r.attempt,0) AS attempt FROM outbound o LEFT JOIN retry r ON o.id=r.id WHERE COALESCE(r.due,0)<=? AND NOT EXISTS (SELECT 1 FROM outbound earlier WHERE earlier.peer=o.peer AND earlier.rowid<o.rowid) ORDER BY o.rowid LIMIT 8',
-        Date.now()
+        "SELECT o.*,COALESCE(r.attempt,0) AS attempt FROM outbound o LEFT JOIN retry r ON o.id=r.id WHERE COALESCE(r.due,0)<=? AND NOT EXISTS (SELECT 1 FROM outbound earlier WHERE earlier.peer=o.peer AND earlier.rowid<o.rowid) ORDER BY o.rowid LIMIT 8",
+        Date.now(),
       )
       .toArray();
     for (const r of ready) {
       try {
         const content = JSON.parse(r.content),
           people = new Set();
-        for (const event of content.pdus ?? (content.event ? [content.event] : [])) {
+        for (const event of content.pdus ??
+          (content.event ? [content.event] : [])) {
           const members = sql.exec(
             "SELECT s.skey FROM room_state s JOIN room_events e ON e.eid=s.eid WHERE s.room=? AND kind='m.room.member' AND json_extract(e.pdu,'$.content.membership') IN ('join','invite')",
-            event.room_id
+            event.room_id,
           );
           for (const m of members) people.add(m.skey);
           people.add(event.sender);
         }
-        for (const edu of content.edus ?? []) people.add(edu.content.sender ?? edu.content.user_id);
+        for (const edu of content.edus ?? [])
+          people.add(edu.content.sender ?? edu.content.user_id);
         for (const user of people) await openParty(this, r.server, user);
-        const response = await remote(this, r.server, r.peer, 'PUT', r.path, content);
+        const response = await remote(
+          this,
+          r.server,
+          r.peer,
+          "PUT",
+          r.path,
+          content,
+        );
         const body = await response.json();
-        if (Object.values(body.pdus ?? {}).some((p) => p.error)) throw Error('Peer rejected room event');
+        if (Object.values(body.pdus ?? {}).some((p) => p.error))
+          throw Error("Peer rejected room event");
         this.ctx.storage.transactionSync(() => {
-          sql.exec('DELETE FROM outbound WHERE id=?', r.id);
-          sql.exec('DELETE FROM retry WHERE id=?', r.id);
+          sql.exec("DELETE FROM outbound WHERE id=?", r.id);
+          sql.exec("DELETE FROM retry WHERE id=?", r.id);
         });
       } catch (e) {
         const delay = Math.min(300000, 2000 * 2 ** Math.min(8, r.attempt));
-        sql.exec('INSERT OR REPLACE INTO retry VALUES(?,?,?)', r.id, r.attempt + 1, Date.now() + delay);
-        console.warn('Federation delivery pending', r.peer, e.message);
+        sql.exec(
+          "INSERT OR REPLACE INTO retry VALUES(?,?,?)",
+          r.id,
+          r.attempt + 1,
+          Date.now() + delay,
+        );
+        console.warn("Federation delivery pending", r.peer, e.message);
       }
     }
     const next = sql
       .exec(
-        'SELECT MIN(COALESCE(r.due,0)) AS due FROM outbound o LEFT JOIN retry r ON o.id=r.id WHERE NOT EXISTS (SELECT 1 FROM outbound earlier WHERE earlier.peer=o.peer AND earlier.rowid<o.rowid)'
+        "SELECT MIN(COALESCE(r.due,0)) AS due FROM outbound o LEFT JOIN retry r ON o.id=r.id WHERE NOT EXISTS (SELECT 1 FROM outbound earlier WHERE earlier.peer=o.peer AND earlier.rowid<o.rowid)",
       )
       .one().due;
-    if (next !== null) await this.ctx.storage.setAlarm(Math.max(Date.now() + 10, next));
+    if (next !== null)
+      await this.ctx.storage.setAlarm(Math.max(Date.now() + 10, next));
   }
   async roomUpdates(server, user, cursor, initial) {
     return roomSync(this, server, user, cursor, initial);
   }
   cryptoUpdates(user, device, cursor) {
     const shared = sharedUsers(this, user);
-    const high = this.sql.exec('SELECT COALESCE(MAX(seq),0) AS n FROM key_changes').one().n;
+    const high = this.sql
+      .exec("SELECT COALESCE(MAX(seq),0) AS n FROM key_changes")
+      .one().n;
     const changed = this.sql
-      .exec('SELECT DISTINCT user FROM key_changes WHERE seq>?', cursor)
+      .exec("SELECT DISTINCT user FROM key_changes WHERE seq>?", cursor)
       .toArray()
       .map((r) => r.user)
       .filter((u) => shared.has(u));
@@ -152,11 +246,18 @@ export class Homeserver extends DurableObject {
   }
   userUpdates(user, cursor) {
     const rows = this.sql
-      .exec('SELECT * FROM user_data WHERE user=? AND seq>? ORDER BY seq', user, cursor)
+      .exec(
+        "SELECT * FROM user_data WHERE user=? AND seq>? ORDER BY seq",
+        user,
+        cursor,
+      )
       .toArray();
     return {
       high: rows.at(-1)?.seq ?? cursor,
-      events: rows.map((r) => ({ type: r.kind, content: JSON.parse(r.content) }))
+      events: rows.map((r) => ({
+        type: r.kind,
+        content: JSON.parse(r.content),
+      })),
     };
   }
 
@@ -167,7 +268,11 @@ export class Homeserver extends DurableObject {
   async login(server, data) {
     const result = await login(this.ctx.storage, server, data);
     if (result.status === 200)
-      this.sql.exec('INSERT OR IGNORE INTO devices VALUES (?,?)', result.body.user_id, result.body.device_id);
+      this.sql.exec(
+        "INSERT OR IGNORE INTO devices VALUES (?,?)",
+        result.body.user_id,
+        result.body.device_id,
+      );
     return result;
   }
 
@@ -178,16 +283,18 @@ export class Homeserver extends DurableObject {
   async party(userId, server) {
     const match = /^@([^:]+):(.+)$/.exec(userId);
     if (!match || match[2] !== server) return null;
-    const account = await this.ctx.storage.get('account/' + match[1]);
-    return account?.userId === userId ? { organisationId: account.organisationId } : null;
+    const account = await this.ctx.storage.get("account/" + match[1]);
+    return account?.userId === userId
+      ? { organisationId: account.organisationId }
+      : null;
   }
 
   async completed(txKey) {
-    return !!(await this.ctx.storage.get('complete/' + txKey));
+    return !!(await this.ctx.storage.get("complete/" + txKey));
   }
   async transactionBody(txKey, proposed) {
     return this.ctx.storage.transaction(async (t) => {
-      const key = 'transaction/' + txKey,
+      const key = "transaction/" + txKey,
         previous = await t.get(key);
       if (previous) return previous;
       await t.put(key, proposed);
@@ -195,9 +302,12 @@ export class Homeserver extends DurableObject {
     });
   }
   async finishDevice(txKey, server, sender, kind, remotes) {
-    const id = 'device/' + txKey;
+    const id = "device/" + txKey;
     this.ctx.storage.transactionSync(() => {
-      if (this.sql.exec('SELECT id FROM received WHERE id=?', id).toArray().length) return;
+      if (
+        this.sql.exec("SELECT id FROM received WHERE id=?", id).toArray().length
+      )
+        return;
       for (const [peer, messages] of remotes)
         queue(
           this,
@@ -206,54 +316,66 @@ export class Homeserver extends DurableObject {
           [],
           [
             {
-              edu_type: 'm.direct_to_device',
-              content: { sender, type: kind, message_id: crypto.randomUUID(), messages }
-            }
-          ]
+              edu_type: "m.direct_to_device",
+              content: {
+                sender,
+                type: kind,
+                message_id: crypto.randomUUID(),
+                messages,
+              },
+            },
+          ],
         );
-      this.sql.exec('INSERT INTO received VALUES(?,?)', id, '{}');
+      this.sql.exec("INSERT INTO received VALUES(?,?)", id, "{}");
     });
     if (remotes.length) await this.ctx.storage.setAlarm(Date.now() + 25);
     await this.complete(txKey);
   }
   async complete(txKey) {
     await this.ctx.storage.transaction(async (t) => {
-      await t.put('complete/' + txKey, true);
-      await t.delete('transaction/' + txKey);
+      await t.put("complete/" + txKey, true);
+      await t.delete("transaction/" + txKey);
     });
   }
   enqueue(txKey, user, id, sender, kind, content) {
     const targets = this.sql
-      .exec('SELECT device FROM devices WHERE user=? AND (device=? OR ?=?)', user, id, id, '*')
+      .exec(
+        "SELECT device FROM devices WHERE user=? AND (device=? OR ?=?)",
+        user,
+        id,
+        id,
+        "*",
+      )
       .toArray();
     for (const { device } of targets) {
       this.sql.exec(
-        'INSERT OR IGNORE INTO delivery(txn,user,device,sender,kind,content) VALUES(?,?,?,?,?,?)',
+        "INSERT OR IGNORE INTO delivery(txn,user,device,sender,kind,content) VALUES(?,?,?,?,?,?)",
         txKey,
         user,
         device,
         sender,
         kind,
-        JSON.stringify(content)
+        JSON.stringify(content),
       );
-      for (const wake of this.waiters.get(JSON.stringify([user, device])) ?? []) wake();
+      for (const wake of this.waiters.get(JSON.stringify([user, device])) ?? [])
+        wake();
     }
   }
   acknowledge(user, device, cursor) {
     this.sql.exec(
-      'UPDATE delivery SET content=NULL WHERE user=? AND device=? AND sequence<=? AND content IS NOT NULL',
+      "UPDATE delivery SET content=NULL WHERE user=? AND device=? AND sequence<=? AND content IS NOT NULL",
       user,
       device,
-      cursor
+      cursor,
     );
   }
   pending(user, device, cursor) {
     return this.sql
       .exec(
-        'SELECT sequence,sender,kind,content FROM delivery WHERE user=? AND device=? AND sequence>? AND content IS NOT NULL ORDER BY sequence LIMIT 100',
+        "SELECT sequence,sender,kind,content FROM delivery WHERE user=? AND device=? AND sequence>? AND content IS NOT NULL ORDER BY sequence LIMIT 100",
         user,
         device,
-        cursor
+        cursor,
       )
       .toArray();
   }
@@ -276,37 +398,50 @@ export class Homeserver extends DurableObject {
 
   catchup(additions) {
     this.sql.exec(
-      'CREATE TABLE IF NOT EXISTS fixture_history (position INTEGER PRIMARY KEY, pdu TEXT NOT NULL)'
+      "CREATE TABLE IF NOT EXISTS fixture_history (position INTEGER PRIMARY KEY, pdu TEXT NOT NULL)",
     );
     const prior = this.sql
-      .exec('SELECT pdu FROM fixture_history ORDER BY position')
+      .exec("SELECT pdu FROM fixture_history ORDER BY position")
       .toArray()
       .map((row) => JSON.parse(row.pdu));
     if (additions.start !== prior.length)
-      return { status: 409, body: { stored: prior.length, error: 'Checkpoint changed' } };
+      return {
+        status: 409,
+        body: { stored: prior.length, error: "Checkpoint changed" },
+      };
     if (
       !Array.isArray(additions.events) ||
       !additions.events.length ||
       prior.length + additions.events.length > 512
     )
-      return { status: 400, body: { error: 'Invalid fixture batch' } };
+      return { status: 400, body: { error: "Invalid fixture batch" } };
     const history = prior.concat(additions.events);
     try {
       verifyFixtureHistory(history);
     } catch {
-      return { status: 400, body: { error: 'Signed history could not be authorised' } };
+      return {
+        status: 400,
+        body: { error: "Signed history could not be authorised" },
+      };
     }
     this.ctx.storage.transactionSync(() => {
       for (const [i, event] of additions.events.entries())
-        this.sql.exec('INSERT INTO fixture_history VALUES(?,?)', prior.length + i, JSON.stringify(event));
+        this.sql.exec(
+          "INSERT INTO fixture_history VALUES(?,?)",
+          prior.length + i,
+          JSON.stringify(event),
+        );
     });
-    return { status: 200, body: { stored: history.length, database_bytes: this.sql.databaseSize } };
+    return {
+      status: 200,
+      body: { stored: history.length, database_bytes: this.sql.databaseSize },
+    };
   }
 
   async profile(userId, server) {
     const local = /^@([^:]+):(.+)$/.exec(userId);
     if (!local || local[2] !== server) return null;
-    const account = await this.ctx.storage.get('account/' + local[1]);
+    const account = await this.ctx.storage.get("account/" + local[1]);
     return account?.userId === userId ? { displayname: local[1] } : null;
   }
 
@@ -319,11 +454,11 @@ function json(body, status = 200) {
   return Response.json(body, {
     status,
     headers: {
-      'Access-Control-Allow-Origin': '*',
-      'Access-Control-Allow-Headers': 'Authorization, Content-Type',
-      'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
-      'Cache-Control': 'no-store'
-    }
+      "Access-Control-Allow-Origin": "*",
+      "Access-Control-Allow-Headers": "Authorization, Content-Type",
+      "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
+      "Cache-Control": "no-store",
+    },
   });
 }
 
@@ -331,154 +466,235 @@ export default {
   async fetch(request, env) {
     const { hostname, pathname } = new URL(request.url);
     if (!Object.hasOwn(env.DOMAINS, hostname))
-      return json({ errcode: 'M_NOT_FOUND', error: 'Unknown endpoint' }, 404);
+      return json({ errcode: "M_NOT_FOUND", error: "Unknown endpoint" }, 404);
     const server = env.DOMAINS[hostname];
-    if (request.method === 'OPTIONS') return json({});
+    if (request.method === "OPTIONS") return json({});
     const homeserver = env.HOMESERVERS.getByName(server);
     if (
-      request.method === 'POST' &&
-      pathname === '/_relay/spike/catchup' &&
+      request.method === "POST" &&
+      pathname === "/_relay/spike/catchup" &&
       env.PROBE_TOKEN &&
-      request.headers.get('Authorization') === 'Bearer ' + env.PROBE_TOKEN
+      request.headers.get("Authorization") === "Bearer " + env.PROBE_TOKEN
     ) {
-      const len = Number(request.headers.get('Content-Length'));
+      const len = Number(request.headers.get("Content-Length"));
       if (!Number.isInteger(len) || len < 1 || len > 1024 * 1024)
-        return json({ error: 'Bounded fixture body required' }, 413);
+        return json({ error: "Bounded fixture body required" }, 413);
       let data;
       try {
         data = await request.json();
       } catch {
-        return json({ error: 'Invalid JSON' }, 400);
+        return json({ error: "Invalid JSON" }, 400);
       }
-      if (!data || typeof data !== 'object') return json({ error: 'Invalid batch' }, 400);
+      if (!data || typeof data !== "object")
+        return json({ error: "Invalid batch" }, 400);
       const result = await homeserver.catchup(data);
       return json(result.body, result.status);
     }
     if (
-      pathname === '/_matrix/client/v1/auth_metadata' ||
-      pathname.startsWith('/_matrix/client/unstable/org.matrix.msc3814.v1/')
+      pathname === "/_matrix/client/v1/auth_metadata" ||
+      pathname.startsWith("/_matrix/client/unstable/org.matrix.msc3814.v1/")
     )
-      return json({ errcode: 'M_UNRECOGNIZED', error: 'Unsupported endpoint' }, 404);
-    const media = await mediaRoute(request, env, server, homeserver, pathname, json);
+      return json(
+        { errcode: "M_UNRECOGNIZED", error: "Unsupported endpoint" },
+        404,
+      );
+    const media = await mediaRoute(
+      request,
+      env,
+      server,
+      homeserver,
+      pathname,
+      json,
+    );
     if (media) return media;
-    const devicePath = /^\/_matrix\/client\/(?:v3|r0)\/sendToDevice\/([^/]+)\/([^/]+)$/.exec(pathname);
-    if (devicePath && request.method === 'PUT') {
+    const devicePath =
+      /^\/_matrix\/client\/(?:v3|r0)\/sendToDevice\/([^/]+)\/([^/]+)$/.exec(
+        pathname,
+      );
+    if (devicePath && request.method === "PUT") {
       let kind, txn;
       try {
         kind = decodeURIComponent(devicePath[1]);
         txn = decodeURIComponent(devicePath[2]);
       } catch {
-        return json({ errcode: 'M_INVALID_PARAM', error: 'Invalid path' }, 400);
+        return json({ errcode: "M_INVALID_PARAM", error: "Invalid path" }, 400);
       }
       const result = await deliver(request, env, server, kind, txn);
       return json(result.body, result.status);
     }
-    if (/^\/_matrix\/client\/(?:v3|r0)\/sync$/.test(pathname) && request.method === 'GET') {
+    if (
+      /^\/_matrix\/client\/(?:v3|r0)\/sync$/.test(pathname) &&
+      request.method === "GET"
+    ) {
       const result = await syncDevices(request, env, server);
       return json(result.body, result.status);
     }
-    if (pathname === '/_matrix/federation/v1/query/profile' && request.method === 'GET') {
-      if (!(await authenticateQuery(request, server, env.PEER_KEYS ?? {})))
+    if (
+      pathname === "/_matrix/federation/v1/query/profile" &&
+      request.method === "GET"
+    ) {
+      if (
+        !(await authenticateQuery(
+          request,
+          server,
+          async (name) => (await homeserver.resolvePeer(name)).keys,
+        ))
+      )
         return json(
-          { errcode: 'M_UNAUTHORIZED', error: 'Federation signature or destination rejected' },
-          401
+          {
+            errcode: "M_UNAUTHORIZED",
+            error: "Federation signature or destination rejected",
+          },
+          401,
         );
       const params = new URL(request.url).searchParams;
-      const profile = await homeserver.profile(params.get('user_id'), server);
-      if (!profile) return json({ errcode: 'M_NOT_FOUND', error: 'Unknown user' }, 404);
-      return json(!params.has('field') || params.get('field') === 'displayname' ? profile : {});
+      const profile = await homeserver.profile(params.get("user_id"), server);
+      if (!profile)
+        return json({ errcode: "M_NOT_FOUND", error: "Unknown user" }, 404);
+      return json(
+        !params.has("field") || params.get("field") === "displayname"
+          ? profile
+          : {},
+      );
     }
-    const client = /^\/_matrix\/client\/(?:v3|r0)\/(login|account\/whoami|logout)$/.exec(pathname)?.[1];
-    if (client === 'login' && request.method === 'GET')
-      return json({ flows: [{ type: 'm.login.password' }] });
+    const client =
+      /^\/_matrix\/client\/(?:v3|r0)\/(login|account\/whoami|logout)$/.exec(
+        pathname,
+      )?.[1];
+    if (client === "login" && request.method === "GET")
+      return json({ flows: [{ type: "m.login.password" }] });
     if (
-      (client === 'account/whoami' && request.method === 'GET') ||
-      (client === 'logout' && request.method === 'POST')
+      (client === "account/whoami" && request.method === "GET") ||
+      (client === "logout" && request.method === "POST")
     ) {
-      const result = await homeserver.session(request.headers.get('Authorization'), client === 'logout');
+      const result = await homeserver.session(
+        request.headers.get("Authorization"),
+        client === "logout",
+      );
       return json(result.body, result.status);
     }
-    if (request.method === 'POST' && (client === 'login' || pathname === '/_relay/spike/provision')) {
+    if (
+      request.method === "POST" &&
+      (client === "login" || pathname === "/_relay/spike/provision")
+    ) {
       const provisioning = !client;
       if (
         provisioning &&
-        (!env.PROVISION_TOKEN || request.headers.get('Authorization') !== 'Bearer ' + env.PROVISION_TOKEN)
+        (!env.PROVISION_TOKEN ||
+          request.headers.get("Authorization") !==
+            "Bearer " + env.PROVISION_TOKEN)
       )
-        return json({ errcode: 'M_FORBIDDEN', error: 'Operator credentials required' }, 403);
+        return json(
+          { errcode: "M_FORBIDDEN", error: "Operator credentials required" },
+          403,
+        );
       let body;
       try {
         body = await request.json();
       } catch {
-        return json({ errcode: 'M_BAD_JSON', error: 'Invalid JSON' }, 400);
+        return json({ errcode: "M_BAD_JSON", error: "Invalid JSON" }, 400);
       }
       if (provisioning) {
         try {
-          if (!(await delegated(server, hostname))) throw Error('Unexpected Matrix endpoint');
+          if (!(await delegated(server, hostname)))
+            throw Error("Unexpected Matrix endpoint");
         } catch (error) {
           return json(
-            { errcode: 'M_FORBIDDEN', error: 'Domain delegation is unverified: ' + error.message },
-            403
+            {
+              errcode: "M_FORBIDDEN",
+              error: "Domain delegation is unverified: " + error.message,
+            },
+            403,
           );
         }
       }
       const result = provisioning
-        ? await homeserver.provision(server, body?.localpart, body?.organisation_id)
+        ? await homeserver.provision(
+            server,
+            body?.localpart,
+            body?.organisation_id,
+          )
         : await homeserver.login(server, body);
       return json(result.body, result.status);
     }
-    if (request.method === 'GET' && server === hostname) {
-      if (pathname === '/.well-known/matrix/client')
-        return json({ 'm.homeserver': { base_url: 'https://' + hostname } });
-      if (pathname === '/.well-known/matrix/server') return json({ 'm.server': hostname + ':443' });
+    if (request.method === "GET" && server === hostname) {
+      if (pathname === "/.well-known/matrix/client")
+        return json({ "m.homeserver": { base_url: "https://" + hostname } });
+      if (pathname === "/.well-known/matrix/server")
+        return json({ "m.server": hostname + ":443" });
     }
     if (
-      request.method === 'POST' &&
-      pathname === '/_relay/spike/replay' &&
+      request.method === "POST" &&
+      pathname === "/_relay/spike/replay" &&
       env.PROBE_TOKEN &&
-      request.headers.get('Authorization') === 'Bearer ' + env.PROBE_TOKEN
+      request.headers.get("Authorization") === "Bearer " + env.PROBE_TOKEN
     ) {
       const result = replayProbe();
       return json(result, result.converged ? 200 : 500);
     }
-    if (request.method === 'GET') {
-      if (pathname === '/_matrix/key/v2/server' || pathname === '/_matrix/key/v2/server/ed25519:1') {
+    if (request.method === "GET") {
+      if (
+        pathname === "/_matrix/key/v2/server" ||
+        pathname === "/_matrix/key/v2/server/ed25519:1"
+      ) {
         const identity = env.HOMESERVERS.getByName(server);
         return json(await identity.keys(server));
       }
-      if (pathname === '/_matrix/federation/v1/version')
-        return json({ server: { name: 'Mauvely Relay spike', version: '0.1.0' } });
-      // Clients use these API generations for login and authenticated media.
-      if (pathname === '/_matrix/client/versions')
+      if (pathname === "/_matrix/federation/v1/version")
         return json({
-          versions: ['v1.1', 'v1.11'],
-          unstable_features: { 'com.mauvely.interop_spike': true }
+          server: { name: "Mauvely Relay spike", version: "0.1.0" },
+        });
+      // Clients use these API generations for login and authenticated media.
+      if (pathname === "/_matrix/client/versions")
+        return json({
+          versions: ["v1.1", "v1.11"],
+          unstable_features: { "com.mauvely.interop_spike": true },
         });
     }
-    const path = /^\/_matrix\/(client|federation)\/(?:v[123]|r0|unstable)\/(.+)$/.exec(pathname);
+    const path =
+      /^\/_matrix\/(client|federation)\/(?:v[123]|r0|unstable)\/(.+)$/.exec(
+        pathname,
+      );
     if (path) {
-      const federation = path[1] === 'federation';
-      const auth = federation ? null : await homeserver.session(request.headers.get('Authorization'), false);
+      const federation = path[1] === "federation";
+      const auth = federation
+        ? null
+        : await homeserver.session(request.headers.get("Authorization"), false);
       if (auth && auth.status !== 200) return json(auth.body, auth.status);
       let parts, body;
       try {
-        parts = path[2].split('/').map(decodeURIComponent);
-        if (['POST', 'PUT'].includes(request.method)) {
+        parts = path[2].split("/").map(decodeURIComponent);
+        if (["POST", "PUT"].includes(request.method)) {
           let bytes;
           try {
             bytes = await limited(request.body, 1024 * 1024);
           } catch {
-            return json({ errcode: 'M_TOO_LARGE', error: 'Request exceeds spike limit' }, 413);
+            return json(
+              { errcode: "M_TOO_LARGE", error: "Request exceeds spike limit" },
+              413,
+            );
           }
           const raw = new TextDecoder().decode(bytes);
-          body = JSON.parse(raw || '{}');
-          if (!body || typeof body !== 'object' || Array.isArray(body)) throw Error();
+          body = JSON.parse(raw || "{}");
+          if (!body || typeof body !== "object" || Array.isArray(body))
+            throw Error();
         }
       } catch {
-        return json({ errcode: 'M_BAD_JSON', error: 'Invalid request' }, 400);
+        return json({ errcode: "M_BAD_JSON", error: "Invalid request" }, 400);
       }
-      const peer = federation ? await authenticatedOrigin(request, server, env.PEER_KEYS ?? {}, body) : null;
+      const peer = federation
+        ? await authenticatedOrigin(
+            request,
+            server,
+            async (name) => (await homeserver.resolvePeer(name)).keys,
+            body,
+          )
+        : null;
       if (federation && !peer)
-        return json({ errcode: 'M_UNAUTHORIZED', error: 'Invalid federation signature' }, 401);
+        return json(
+          { errcode: "M_UNAUTHORIZED", error: "Invalid federation signature" },
+          401,
+        );
       const result = await homeserver.api(
         server,
         auth?.body,
@@ -486,10 +702,13 @@ export default {
         request.method,
         parts,
         new URL(request.url).search,
-        body
+        body,
       );
       return json(result.body, result.status);
     }
-    return json({ errcode: 'M_UNRECOGNIZED', error: 'Unsupported endpoint' }, 404);
-  }
+    return json(
+      { errcode: "M_UNRECOGNIZED", error: "Unsupported endpoint" },
+      404,
+    );
+  },
 };
