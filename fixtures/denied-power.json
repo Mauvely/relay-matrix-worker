@@ -1,0 +1,30 @@
+{
+  "type": "m.room.power_levels",
+  "state_key": "",
+  "room_id": "!qIocSATidCXNPIbTik:synapse.matrix.test",
+  "sender": "@bob00176b11:synapse.matrix.test",
+  "origin": "synapse.matrix.test",
+  "origin_server_ts": 1795276531413,
+  "depth": 10,
+  "prev_events": [
+    "$M-bFf8As4Pg0pVdZ2fEp914jJ6Y6hCCXuB_TB7kndHk"
+  ],
+  "auth_events": [
+    "$Zflhc8w_7chWeYUDXbcKVYDN0AyGxYszqgBepAVJeVI",
+    "$o5c6C51ySJxZ2PktYAvPjwDiiDbynTc6_SKZSBQ3NI0",
+    "$-B7FdrZX0BEqAuvij7G8cuNqSC0l6HLwBDE_WCLYj4U"
+  ],
+  "content": {
+    "users": {
+      "@bob00176b11:synapse.matrix.test": 100
+    }
+  },
+  "hashes": {
+    "sha256": "e3r5wHURIVwgIZYAJTqNYRdmrsrj7jc/Ya7yKWE28qU"
+  },
+  "signatures": {
+    "synapse.matrix.test": {
+      "ed25519:a_wEik": "KIHts/ugbs5vs7Ts+hrcdZadJ+GB71dgGJ/B5XYInaRRAfdoSNvrHrfJCbt27A7IbkfrYB58yK4OA5IWvQW9Dg"
+    }
+  }
+}

@@ -17,3 +17,8 @@ test('a changed signed event is refused', () => {
   const event = {...pdus[0],sender:'@other:synapse.matrix.test'};
   assert.throws(() => replay(JSON.stringify([event]), keys));
 });
+
+test('a correctly signed power-level change by an ordinary joined member is denied', () => {
+  const denied = JSON.parse(readFileSync(new URL('./fixtures/denied-power.json', import.meta.url)));
+  assert.throws(() => replay(JSON.stringify([...pdus, denied]), keys), /power|authoris|authoriz|level/i);
+});
