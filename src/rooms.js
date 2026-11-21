@@ -28,6 +28,8 @@ export function schema(sql) {
     CREATE INDEX IF NOT EXISTS room_history ON room_events(room,seq);
     CREATE TABLE IF NOT EXISTS room_state(room TEXT,kind TEXT,skey TEXT,eid TEXT,PRIMARY KEY(room,kind,skey));
     CREATE TABLE IF NOT EXISTS room_checkpoints(room TEXT,first_seq INTEGER,last_seq INTEGER,state TEXT,PRIMARY KEY(room,last_seq));
+    CREATE TABLE IF NOT EXISTS federation_gap_events(room TEXT,peer TEXT,head TEXT,eid TEXT,pdu TEXT NOT NULL,expires INTEGER,PRIMARY KEY(room,peer,head,eid));
+    CREATE INDEX IF NOT EXISTS gap_expiry ON federation_gap_events(expires);
     CREATE TABLE IF NOT EXISTS room_tips(room TEXT,eid TEXT,PRIMARY KEY(room,eid));
     CREATE TABLE IF NOT EXISTS profile_updates(server TEXT,user TEXT,room TEXT,due INTEGER DEFAULT 0,PRIMARY KEY(user,room));
     CREATE TABLE IF NOT EXISTS room_tx(id TEXT PRIMARY KEY,eid TEXT);

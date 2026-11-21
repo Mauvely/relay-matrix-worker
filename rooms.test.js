@@ -149,6 +149,38 @@ for (const version of [10,11]) test(`private v${version} room checks invitations
   await receiveEvent(home,server,peer,arriving,recovered);
   await receiveEvent(home,server,peer,arriving,recovered);
   assert.equal((await messages(user,{dir:'b',limit:1})).chunk[0].content.body,'last received');
+  // The peer returns one predecessor per page, forcing a retry after eight.
+  const offline = load(home,server,room);
+  const chain = [];
+  for (let i = 0; i < 11; i++) {
+    chain.push(await offline.local(remote,other,'m.room.message',{msgtype:'m.text',body:String(i)}));
+  }
+  const last = chain.at(-1);
+  const pages = new Map(chain.slice(1).map((event, i) => [eventId(event,version), chain[i]]));
+  const requested = [];
+  const page = async (_home, _server, _peer, _method, _uri, body) => {
+    const [from] = body.latest_events;
+    requested.push(from);
+    return Response.json({events:[pages.get(from)]});
+  };
+  await assert.rejects(recoverPredecessors(home,server,peer,last,page),/complete predecessor chain/);
+  assert.equal(requested.length, 8);
+  assert.equal((await messages(user,{dir:'b',limit:1})).chunk[0].content.body,'last received');
+  const resumed = {...home, waiters:new Map()};
+  const complete = await recoverPredecessors(resumed,server,peer,last,page);
+  assert.deepEqual(complete,chain.slice(0,-1));
+  assert.equal(requested.length,10);
+  assert.equal(new Set(requested).size,10);
+  const { inviteSchema } = await import('./src/invites.js');
+  inviteSchema(sql);
+  const { federationApi } = await import('./src/api.js');
+  const deliver = () => federationApi(resumed,server,peer,'PUT',['send','resumed'],new URLSearchParams(),
+    {origin:peer,pdus:[last],edus:[]},new Map([[last,complete]]));
+  assert.deepEqual((await deliver()).body.pdus[eventId(last,version)],{});
+  assert.deepEqual((await deliver()).body.pdus[eventId(last,version)],{});
+  assert.equal(sql.exec('SELECT COUNT(*) AS n FROM federation_gap_events').one().n,0);
+  assert.deepEqual((await messages(user,{dir:'b',limit:11})).chunk.map(e => e.content.body),
+    chain.map(e=>e.content.body).reverse());
   const acl = (allow,deny) => roomClient(home,server,{user_id:user},'PUT',[room,'state','m.room.server_acl',''],{allow,deny});
   await acl(['*'],['synapse.*']);
   await assert.rejects(make,(e) => e.status===403 && e.errcode==='M_FORBIDDEN');

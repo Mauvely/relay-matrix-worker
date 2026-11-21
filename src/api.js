@@ -13,6 +13,7 @@ import {
 } from './rooms.js';
 import { remote } from './federation.js';
 import { limited } from './media.js';
+import { clearGap } from './gaps.js';
 import { receiveInvite } from './invites.js';
 import { backup } from './backup.js';
 import { clientKeys, localKeys } from './keys.js';
@@ -201,11 +202,15 @@ export async function federationApi(home, server, peer, method, parts, params, b
         const recovered = gaps.get(p);
         // Other PDUs in this transaction may already have filled the gap.
         await receiveEvent(home, server, peer, p, Array.isArray(recovered) ? recovered : []);
+        if (Array.isArray(recovered) && recovered.length) clearGap(home.sql,p.room_id,peer,id);
         pdus[id] = {};
       } catch (e) {
         if (e.status === 503)
           return {status:503,body:{errcode:'M_UNAVAILABLE',error:'Predecessor recovery pending'}};
-        if (id) pdus[id] = { error: e.message ?? String(e) };
+        if (id) {
+          if (gaps.get(p)?.length) clearGap(home.sql,p.room_id,peer,id);
+          pdus[id] = { error: e.message ?? String(e) };
+        }
       }
     }
     for (const { edu_type, content } of body.edus ?? []) {
