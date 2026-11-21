@@ -7,6 +7,7 @@ import {
   reference_id,
   replay
 } from '../room-v10/pkg/relay_room_v10.js';
+import { signingKeyId } from './identity.js';
 import { sign } from './federation.js';
 
 export const domain = (user) => /^@[^:]+:(.+)$/.exec(user)?.[1];
@@ -28,7 +29,7 @@ export async function signPdu(identity, server, pdu) {
   return {
     ...pdu,
     hashes: { sha256: hash },
-    signatures: { ...pdu.signatures, [server]: { 'ed25519:1': await sign(identity, redacted) } }
+    signatures: { ...pdu.signatures, [server]: { [signingKeyId(identity)]: await sign(identity, redacted) } }
   };
 }
 export class RoomGraph {

@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
+import { verificationKeys } from './identity.js';
 import { graphKeys, peerRecord } from './discovery.js';
 import { limited } from './media.js';
 import { verify_signed_pdu } from '../room-v10/pkg/relay_room_v10.js';
@@ -195,7 +196,7 @@ export async function joinRemote(home, server, user, room, invite) {
   for (const origin of origins) await peerRecord(home, origin);
   const keys = {
     ...graphKeys(home),
-    [server]: { 'ed25519:1': home.identity.publicKey }
+    [server]: verificationKeys(home.identity)
   };
   const imported = ordered.map((p) => ({
     eid: eventId(p),

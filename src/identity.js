@@ -36,8 +36,42 @@ export async function createIdentity() {
   };
 }
 
+// Older tenants stored only the key pair and used the initial key ID.
+export const signingKeyId = (identity) => identity.keyId ?? 'ed25519:1';
+export const verificationKeys = (identity) => ({ [signingKeyId(identity)]: identity.publicKey });
+
+export async function initializeIdentity(storage, restoring, signingFile) {
+  const slot = 'ed25519:1';
+  const current = await storage.get(slot);
+  if (!restoring || !signingFile) {
+    if (current) return current;
+    if (restoring) throw Error('Signing identity is missing for the designated server');
+    const fresh = await createIdentity();
+    await storage.put(slot, fresh);
+    return fresh;
+  }
+  // Synapse's signing file stores an unpadded base64 Ed25519 seed.
+  const line = /^ed25519[ \t]+([a-zA-Z0-9_]+)[ \t]+([A-Za-z0-9+/]{43}=?)$/.exec(signingFile.trim());
+  if (!line) throw Error('Expected a single Synapse Ed25519 signing key');
+  const seed = Uint8Array.from(atob(line[2]), (c) => c.charCodeAt(0));
+  // RFC 8410 PKCS#8 PrivateKeyInfo for a 32-byte Ed25519 private key.
+  const pkcs8 = Uint8Array.from([0x30, 46, 2, 1, 0, 0x30, 5, 6, 3, 0x2b, 0x65, 0x70, 4, 34, 4, 32, ...seed]);
+  const key = await crypto.subtle.importKey('pkcs8', pkcs8, 'Ed25519', true, ['sign']);
+  const privateKey = await crypto.subtle.exportKey('jwk', key);
+  const publicKey = privateKey.x.replace(/-/g, '+').replace(/_/g, '/');
+  const keyId = 'ed25519:' + line[1];
+  if (current) {
+    if (current.publicKey !== publicKey || signingKeyId(current) !== keyId)
+      throw Error('The supplied signing identity conflicts with the stored identity');
+    return current;
+  }
+  const identity = { keyId, privateKey, publicKey };
+  await storage.put(slot, identity);
+  return identity;
+}
+
 export async function signServerKeys(serverName, identity, now = Date.now()) {
-  const id = 'ed25519:1';
+  const id = signingKeyId(identity);
   const body = {
     server_name: serverName,
     valid_until_ts: now + 86400000,

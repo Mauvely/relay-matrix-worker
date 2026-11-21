@@ -13,7 +13,7 @@ import { delegated, ensureManagedAccount, issueLoginCode, redeemLoginCode, ssoRe
 import { replayProbe, verifyFixtureHistory } from './probe.js';
 import { DurableObject, WorkerEntrypoint } from 'cloudflare:workers';
 import { discoverPeer } from './discovery.js';
-import { canonical, createIdentity, signServerKeys } from './identity.js';
+import { canonical, initializeIdentity, signServerKeys } from './identity.js';
 
 // Private RPC binding for the account owner. The public fetch handler has no equivalent route.
 export class AccountDirectory extends WorkerEntrypoint {
@@ -56,11 +56,8 @@ export class Homeserver extends DurableObject {
     backupSchema(this.sql);
     mediaSchema(this.sql);
     ctx.blockConcurrencyWhile(async () => {
-      this.identity = await ctx.storage.get('ed25519:1');
-      if (!this.identity) {
-        this.identity = await createIdentity();
-        await ctx.storage.put('ed25519:1', this.identity);
-      }
+      const restoring = Boolean(env.SIGNING_KEY_SERVER) && ctx.id.equals(env.HOMESERVERS.idFromName(env.SIGNING_KEY_SERVER));
+      this.identity = await initializeIdentity(ctx.storage, restoring, env.SYNAPSE_SIGNING_KEY);
     });
   }
 
@@ -536,7 +533,7 @@ export default {
       return json(result, result.converged ? 200 : 500);
     }
     if (request.method === 'GET') {
-      if (pathname === '/_matrix/key/v2/server' || pathname === '/_matrix/key/v2/server/ed25519:1') {
+      if (/^\/_matrix\/key\/v2\/server(?:\/ed25519(?::|%3a)[a-z0-9_]+)?$/i.test(pathname)) {
         const identity = env.HOMESERVERS.getByName(server);
         return json(await identity.keys(server));
       }

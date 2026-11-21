@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
+import { verificationKeys } from './identity.js';
 import { StoredEvents } from './stored-events.js';
 import { graphKeys, peerRecord } from './discovery.js';
 import { clientEvent, domain, eventId, RoomGraph } from './graph.js';
@@ -26,7 +27,7 @@ export function schema(sql) {
 }
 function load(home, server, room) {
   const sql = home.sql;
-  const keys = { ...graphKeys(home), [server]: { 'ed25519:1': home.identity.publicKey } };
+  const keys = { ...graphKeys(home), [server]: verificationKeys(home.identity) };
   const tips = new Set(sql.exec('SELECT eid FROM room_tips WHERE room=?', room).toArray().map((r) => r.eid));
   if (!tips.size) {
     // Rooms from before the checkpoint schema have at most 512 PDUs. Rebuild their tips once.
@@ -454,7 +455,7 @@ function stateBeforeStream(home, server, room, firstSeq) {
   }
   // Older rooms lack checkpoints. A sync may also start inside an imported multi-event batch.
   const prior = home.sql.exec('SELECT eid,pdu FROM room_events WHERE room=? AND seq<? ORDER BY seq', room, firstSeq).toArray();
-  const keys = { ...graphKeys(home), [server]: { 'ed25519:1': home.identity.publicKey } };
+  const keys = { ...graphKeys(home), [server]: verificationKeys(home.identity) };
   const prefix = new RoomGraph(room, keys, prior);
   return [...prefix.state.values()].map((id) => clientEvent(prefix.events.get(id), id));
 }

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 import { peerRecord } from './discovery.js';
-import { canonical, base64 } from './identity.js';
+import { canonical, base64, signingKeyId } from './identity.js';
 
 // In the interoperability deployment the operator pins the reference servers' keys.
 // The transport destination is operator-configured separately from the canonical name.
@@ -69,7 +69,7 @@ export async function remote(home, origin, destination, method, uri, content) {
     redirect: 'manual',
     signal: AbortSignal.timeout(15000),
     headers: {
-      Authorization: `X-Matrix origin="${origin}",destination="${destination}",key="ed25519:1",sig="${signature}"`,
+      Authorization: `X-Matrix origin="${origin}",destination="${destination}",key="${signingKeyId(home.identity)}",sig="${signature}"`,
       'Content-Type': 'application/json'
     },
     body: content === undefined ? undefined : JSON.stringify(content)
