@@ -27,7 +27,10 @@ export class AccountDirectory extends WorkerEntrypoint {
 
   async ensure(server, accountId, localpart, organisationId) {
     const endpoint = this.env.ACCOUNT_ENDPOINT;
-    if (!endpoint || this.env.DOMAINS?.[endpoint] !== server || !(await delegated(server, endpoint)))
+    // The first-party apex is itself a Worker. Its binding serves the same discovery documents
+    // without a same-zone public subrequest hitting the zone's bot challenge.
+    const read = this.env.ACCOUNT_DISCOVERY ? (url, init) => this.env.ACCOUNT_DISCOVERY.fetch(url, init) : fetch;
+    if (!endpoint || this.env.DOMAINS?.[endpoint] !== server || !(await delegated(server, endpoint, read)))
       throw Error('Account homeserver is not active');
     return this.env.HOMESERVERS.getByName(server).ensureAccount(server, accountId, localpart, organisationId);
   }
