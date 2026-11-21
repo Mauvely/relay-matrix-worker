@@ -34,10 +34,34 @@ export function sharedUsers(home, user) {
   );
   return new Set([user, ...rows.toArray().map((r) => r.user)]);
 }
+function signedDevice(home, user, device) {
+  const row = home.sql
+    .exec(
+      'SELECT device,body FROM device_keys WHERE user=? AND (device=? OR ? IS NULL) ORDER BY device LIMIT 1',
+      user,
+      device,
+      device
+    )
+    .toArray()[0];
+  if (!row) return null;
+  const keys = JSON.parse(row.body);
+  const sig = home.sql
+    .exec('SELECT body FROM key_signatures WHERE signer=? AND target=? AND id=?', user, user, row.device)
+    .toArray()[0];
+  if (sig) {
+    keys.signatures ??= {};
+    keys.signatures[user] = { ...keys.signatures[user], ...JSON.parse(sig.body) };
+  }
+  return { device_id: row.device, keys };
+}
 function changed(home, server, user, device, keys) {
   const last = home.sql.exec('SELECT MAX(seq) AS n FROM key_changes WHERE user=?', user).one().n;
   home.sql.exec('INSERT INTO key_changes(user) VALUES(?)', user);
   const stream = home.sql.exec('SELECT last_insert_rowid() AS n').one().n;
+  // Omitting keys in a delta can replace an encrypted device with a keyless
+  // entry on Synapse. Identity/signature changes require a full device-list fetch.
+  const entry = signedDevice(home, user, device) ?? signedDevice(home, user, null);
+  if (!entry) return;
   for (const peer of new Set([...sharedUsers(home, user)].map(domain)))
     if (peer !== server)
       queue(
@@ -48,16 +72,34 @@ function changed(home, server, user, device, keys) {
         [
           {
             edu_type: 'm.device_list_update',
-            content: {
-              user_id: user,
-              device_id: device,
-              stream_id: stream,
-              prev_id: last ? [last] : [],
-              keys
-            }
+            content: { user_id: user, ...entry, stream_id: stream, prev_id: keys && last ? [last] : [] }
           }
         ]
       );
+}
+export function announceJoinedDevices(home, server, room) {
+  const participants = home.sql
+    .exec(
+      `SELECT skey FROM room_state s JOIN room_events e ON e.eid=s.eid
+    WHERE s.room=? AND kind='m.room.member' AND json_extract(e.pdu,'$.content.membership')='join'`,
+      room
+    )
+    .toArray()
+    .map((r) => r.skey);
+  const peers = new Set(participants.map(domain).filter((d) => d !== server));
+  if (!peers.size) return;
+  const edus = [];
+  for (const user of participants.filter((id) => domain(id) === server)) {
+    const entry = signedDevice(home, user, null);
+    if (!entry) continue;
+    home.sql.exec('INSERT INTO key_changes(user) VALUES(?)', user);
+    const stream = home.sql.exec('SELECT last_insert_rowid() AS n').one().n;
+    edus.push({
+      edu_type: 'm.device_list_update',
+      content: { user_id: user, ...entry, stream_id: stream, prev_id: [] }
+    });
+  }
+  if (edus.length) for (const peer of peers) queue(home, server, peer, [], edus);
 }
 const bad = () => fail(400, 'M_INVALID_PARAM', 'Key identity or format is invalid');
 const usageMap = { master_key: 'master', self_signing_key: 'self_signing', user_signing_key: 'user_signing' };

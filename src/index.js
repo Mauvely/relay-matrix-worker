@@ -4,7 +4,7 @@ import module from '../room-v10/pkg/relay_room_v10_bg.wasm';
 import { initSync } from '../room-v10/pkg/relay_room_v10.js';
 import { inviteSchema, joinRemote, remoteInvites } from './invites.js';
 import { backupSchema } from './backup.js';
-import { keySchema, keyCounts, sharedUsers } from './keys.js';
+import { announceJoinedDevices, keySchema, keyCounts, sharedUsers } from './keys.js';
 import { clientApi, federationApi } from './api.js';
 import { getRemote, limited, mediaSchema, mediaRoute } from './media.js';
 import { openParty, queue, schema, roomSync } from './rooms.js';
@@ -64,6 +64,8 @@ export class Homeserver extends DurableObject {
     // Peers may call back for our signing key while answering a join or key query.
     const callsPeer = invite || (!peer && parts[0] === 'keys' && ['claim', 'query'].includes(parts[1]));
     const result = callsPeer ? await run() : await this.ctx.blockConcurrencyWhile(run);
+    if (result.status === 200 && (joining || (peer && parts[0] === 'send_join')))
+      this.ctx.storage.transactionSync(() => announceJoinedDevices(this, server, parts[1]));
     if (
       this.sql.exec('SELECT 1 FROM outbound LIMIT 1').toArray().length &&
       (await this.ctx.storage.getAlarm()) === null
