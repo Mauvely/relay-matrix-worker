@@ -259,3 +259,11 @@ pub fn check_linear(event: &str, keys: &str, predecessor: &str, state: &str, aut
     trace.states.insert(predecessor, snapshot);
     trace.apply(obj, &keys)
 }
+
+#[wasm_bindgen]
+pub fn acl_allows(event_content: &str, server: &str) -> bool {
+    use ruma_events::room::server_acl::RoomServerAclEventContent;
+    let Ok(content) = serde_json::from_str::<RoomServerAclEventContent>(event_content) else { return false; };
+    let Ok(name) = <&ruma_common::ServerName>::try_from(server) else { return false; };
+    content.is_allowed(name)
+}

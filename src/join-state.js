@@ -7,7 +7,7 @@ import { eventId } from './graph.js';
 export function joinBase(room, state, chain, join, version = 10) {
   const pool = new Map();
   for (const event of [...chain, ...state]) {
-    if (event.room_id !== room || typeof event.state_key !== 'string' || event.type === 'm.room.server_acl')
+    if (event.room_id !== room || typeof event.state_key !== 'string')
       throw Error('Unsupported remote room state');
     const {unsigned, ...signed} = event;
     pool.set(eventId(event,version), signed);

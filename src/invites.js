@@ -5,7 +5,7 @@ import { limited } from './media.js';
 import { verify_signed_pdu } from '../room-v10/pkg/relay_room_v10.js';
 import { joinBase, resolveJoin } from './join-state.js';
 import { domain, eventId, signPdu } from './graph.js';
-import { openParty, ok, fail, missing, save, receiveEvent, load } from './rooms.js';
+import { openParty, ok, fail, missing, save, receiveEvent, load, requireRoomAccess } from './rooms.js';
 import { remote } from './federation.js';
 
 export function inviteSchema(sql) {
@@ -30,6 +30,11 @@ export async function receiveInvite(home, server, peer, room, id, body) {
     eventId(p,version) !== id
   )
     fail(400, 'M_INVALID_PARAM', 'Invalid invite event');
+  const existing = load(home,server,room);
+  if (existing.tips.size) {
+    requireRoomAccess(existing.get('m.room.server_acl'),peer);
+    if (existing.version !== version) fail(400,'M_INCOMPATIBLE_ROOM_VERSION','Room version differs from local state');
+  }
   await openParty(home, server, p.state_key);
   verify_signed_pdu(JSON.stringify(p), JSON.stringify(graphKeys(home)),version);
   const signed = await signPdu(home.identity, server, p,version);
@@ -156,6 +161,9 @@ export async function joinRemote(home, server, user, room, invite) {
   for (const origin of origins) if (origin !== server) await peerRecord(home, origin);
   const keys = { ...graphKeys(home), [server]: verificationKeys(home.identity) };
   const state = new Map(resolveJoin(room, keys, base, [],version).map(([type,key,id]) => [JSON.stringify([type,key]),id]));
+  const acl = response.state.find((p) => p.type === 'm.room.server_acl' && p.state_key === '');
+  requireRoomAccess(acl,server);
+  requireRoomAccess(acl,peer);
   const members = response.state.filter((p) => p.type === 'm.room.member');
   if (!members.some((m) => domain(m.state_key) === peer && m.content.membership === 'join'))
     fail(403, 'M_FORBIDDEN', 'The assisting server is not resident in this room');

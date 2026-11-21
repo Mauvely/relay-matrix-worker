@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
+import { acl_allows } from '../room-v10/pkg/relay_room_v10.js';
 import { verificationKeys } from './identity.js';
 import { StoredEvents } from './stored-events.js';
 import { graphKeys, peerRecord } from './discovery.js';
@@ -69,6 +70,11 @@ export async function openParty(home, server, user) {
   if (!p) missing();
   if (p.organisationId !== null && home.env.ORGANISATIONS?.[p.organisationId]?.policy !== 'open')
     denied('Managed room operations are unavailable for this account');
+}
+// Room ACLs govern network participation independently of Matrix event authorization.
+export function requireRoomAccess(acl, server) {
+  if (acl && !acl_allows(JSON.stringify(acl.content),server))
+    denied('Server is denied by the room access control list');
 }
 async function checkParties(home, server, g) {
   for (const e of g.members())
@@ -240,7 +246,7 @@ export async function create(home, server, user, data) {
       !isObject(e) ||
       !isObject(e.content) ||
       typeof e.type !== 'string' ||
-      ['m.room.create', 'm.room.member', 'm.room.server_acl', 'm.room.power_levels'].includes(e.type)
+      ['m.room.create', 'm.room.member', 'm.room.power_levels'].includes(e.type)
     )
       invalid('Invalid initial state event');
     await add(e.type, e.content, e.state_key ?? '');
@@ -368,13 +374,22 @@ export async function roomClient(home, server, auth, method, parts, data, params
     }
     return ok([...g.state.values()].map((id) => clientEvent(g.events.get(id), id)));
   }
+  if (method === 'GET' && action === 'joined_members') {
+    const joined = Object.fromEntries(g.members('join').map(({state_key, content}) => [state_key, {
+      ...(typeof content.displayname === 'string' && {display_name: content.displayname}),
+      ...(typeof content.avatar_url === 'string' && {avatar_url: content.avatar_url})
+    }]));
+    return ok({joined});
+  }
   if (method === 'GET' && action === 'members') return ok({ chunk: g.members().map((e) => clientEvent(e,eventId(e,g.version))) });
+  if (method !== 'GET') requireRoomAccess(g.get('m.room.server_acl'), server);
   let type,
     content = data,
     stateKey,
     tx;
   if (method === 'POST' && ['join', 'invite', 'leave'].includes(action)) {
     stateKey = action === 'invite' ? data.user_id : user;
+    if (action === 'invite') requireRoomAccess(g.get('m.room.server_acl'),domain(stateKey));
     await openParty(home, server, stateKey);
     type = 'm.room.member';
     content = { membership: action, ...(action === 'join' && await home.profile?.(user,server)) };
@@ -387,7 +402,7 @@ export async function roomClient(home, server, auth, method, parts, data, params
     method === 'PUT' &&
     action === 'state' &&
     kind &&
-    !['m.room.member', 'm.room.create', 'm.room.server_acl'].includes(kind)
+    !['m.room.member', 'm.room.create'].includes(kind)
   ) {
     type = kind;
     stateKey = key ?? '';
@@ -407,6 +422,7 @@ export async function fedRoom(home, server, peer, method, parts, params, body) {
     g = load(home, server, room);
   if (!g.tips.size) missing();
   await checkParties(home, server, g);
+  requireRoomAccess(g.get('m.room.server_acl'),peer);
   if (g.get('m.room.create')?.content['m.federate'] === false) denied('Federation disabled');
   if (action === 'make_join' && method === 'GET') {
     if (domain(value) !== peer) denied('Origin must own user');
@@ -472,11 +488,11 @@ export async function receiveEvent(home, server, peer, pdu) {
   if (domain(pdu.sender) !== peer) denied('Unsupported relayed origin');
   const g = load(home, server, pdu.room_id);
   if (!g.tips.size || !g.members('join').some((e) => domain(e.state_key) === server)) missing();
+  requireRoomAccess(g.get('m.room.server_acl'),peer);
   if (g.events.has(eventId(pdu,g.version))) return;
   await checkParties(home, server, g);
   if (g.get('m.room.member', pdu.sender)?.content.membership !== 'join')
     denied('Sender is not currently joined');
-  if (pdu.type === 'm.room.server_acl') denied('Server ACLs are unavailable on the spike');
   if (pdu.type === 'm.room.member') await openParty(home, server, pdu.state_key);
   // A stale branch can have valid historical authorization and still fail current
   // authorization. Check both snapshots before making its event visible to clients.

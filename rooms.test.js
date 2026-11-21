@@ -6,7 +6,7 @@ import { readFileSync } from 'node:fs';
 import { initSync, prepare_event } from './room-v10/pkg/relay_room_v10.js';
 import { createIdentity } from './src/identity.js';
 import { sign } from './src/federation.js';
-import { schema, create, fedRoom, load, roomClient, roomSync } from './src/rooms.js';
+import { schema, create, fedRoom, load, requireRoomAccess, receiveEvent, roomClient, roomSync } from './src/rooms.js';
 import { eventId, signPdu } from './src/graph.js';
 initSync({ module: readFileSync(new URL('./room-v10/pkg/relay_room_v10_bg.wasm', import.meta.url)) });
 for (const version of [10,11]) test(`private v${version} room checks invitations, signed state and join retries`, async () => {
@@ -77,6 +77,9 @@ for (const version of [10,11]) test(`private v${version} room checks invitations
   assert.deepEqual(resolved,resolveJoin(room,keys,base,forks.toReversed(),version));
   assert.ok(resolved.some(([type,key,id]) =>
     type === 'm.room.topic' && forks.some((pdu) => eventId(pdu,version) === id)));
+  const joinedMembers = (who) => roomClient(home,server,{user_id:who},'GET',[room,'joined_members']);
+  assert.deepEqual(Object.keys((await joinedMembers(user)).body.joined).sort(),[user,other].sort());
+  await assert.rejects(joinedMembers('@unknown:'+server),/membership/i);
   const initial = await roomSync(home, server, user, 0, true);
   const timeline = initial.rooms.join[room].timeline;
   assert.ok(timeline.events.some((e) => e.sender === other));
@@ -106,6 +109,13 @@ for (const version of [10,11]) test(`private v${version} room checks invitations
   );
   await assert.rejects(messages(user, { dir: 'b', from: '!another:server/9' }), /history token/);
   await assert.rejects(messages('@stranger:' + server, { dir: 'b' }), /membership/i);
+  const acl = (allow,deny) => roomClient(home,server,{user_id:user},'PUT',[room,'state','m.room.server_acl',''],{allow,deny});
+  await acl(['*'],['synapse.*']);
+  await assert.rejects(make,(e) => e.status===403 && e.errcode==='M_FORBIDDEN');
+  await assert.rejects(join(),(e) => e.status===403);
+  await assert.rejects(receiveEvent(home,server,peer,p),(e) => e.status===403);
+  await acl(['*'],[]);
+  assert.equal((await make()).status,200);
 });
 
 test('linear rooms grow beyond 512 events without replaying every prior message', async () => {
@@ -143,4 +153,13 @@ test('linear rooms grow beyond 512 events without replaying every prior message'
   assert.equal(page.body.chunk.length,100);
   assert.ok(page.body.end);
   db.close();
+});
+
+test('ACLs use the server hostname, prefer deny rules and support case-insensitive globs and IP rules', () => {
+  const acl={content:{allow:['*.example'],deny:['b?.example'],allow_ip_literals:false}};
+  requireRoomAccess(acl,'chat.EXAMPLE:8448');
+  for (const name of ['bb.example','another.test','127.0.0.1:443','[::1]:8448']) {
+    assert.throws(() => requireRoomAccess(acl,name),(e) => e.status===403);
+  }
+  assert.throws(() => requireRoomAccess({content:{}},'chat.example'));
 });
