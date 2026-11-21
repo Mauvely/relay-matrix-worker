@@ -206,6 +206,15 @@ export class Homeserver extends DurableObject {
   async mediaRemote(server, peer, id) {
     return getRemote(this, server, peer, id);
   }
+  // Operator-only Durable Object binding. This never returns event bodies or credentials.
+  federationDeliveryStatus(peer) {
+    const backlog = this.sql.exec('SELECT COUNT(*) AS pending FROM outbound WHERE peer=?',peer).one().pending;
+    const next = this.sql.exec(
+      'SELECT o.path LIKE ? AS is_invite,COALESCE(r.attempt,0) AS retries,COALESCE(r.due,0) AS due FROM outbound o LEFT JOIN retry r ON r.id=o.id WHERE o.peer=? ORDER BY o.rowid LIMIT 1',
+      '/_matrix/federation/v2/invite/%',peer).toArray()[0];
+    const rejected = this.sql.exec('SELECT events FROM federation_delivery_failures WHERE peer=?',peer).toArray()[0]?.events ?? 0;
+    return {backlog,next:next ? {...next} : null,rejected};
+  }
   async alarm() {
     for (const {server,user,room} of this.sql.exec('SELECT * FROM profile_updates WHERE due<=? LIMIT 8', Date.now()).toArray()) {
       try {
@@ -240,11 +249,18 @@ export class Homeserver extends DurableObject {
         for (const user of people) await openParty(this, r.server, user);
         const response = await remote(this, r.server, r.peer, 'PUT', r.path, content);
         const body = await response.json();
-        if (Object.values(body.pdus ?? {}).some((p) => p.error)) throw Error('Peer rejected room event');
+        // A successful /send response completes this transaction. The recipient
+        // caches its per-event decisions under the transaction ID. Resending
+        // that ID cannot change them and would block every later room on that peer.
+        const rejected = Object.values(body.pdus ?? {}).filter(p => p?.error).length;
         this.ctx.storage.transactionSync(() => {
+          if (rejected) sql.exec(
+            'INSERT INTO federation_delivery_failures VALUES(?,?,?) ON CONFLICT(peer) DO UPDATE SET events=events+excluded.events,last_at=excluded.last_at',
+            r.peer,rejected,Date.now());
           sql.exec('DELETE FROM outbound WHERE id=?', r.id);
           sql.exec('DELETE FROM retry WHERE id=?', r.id);
         });
+        if (rejected) console.warn('Federation delivery completed with rejected events',r.peer,rejected);
       } catch (e) {
         const delay = Math.min(300000, 2000 * 2 ** Math.min(8, r.attempt));
         sql.exec('INSERT OR REPLACE INTO retry VALUES(?,?,?)', r.id, r.attempt + 1, Date.now() + delay);

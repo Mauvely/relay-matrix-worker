@@ -6,12 +6,12 @@ import { readFileSync } from 'node:fs';
 import { initSync, prepare_event } from './room-v10/pkg/relay_room_v10.js';
 import { createIdentity } from './src/identity.js';
 import { sign } from './src/federation.js';
-import { schema, create, fedRoom, load, requireRoomAccess, receiveEvent, roomClient, roomSync } from './src/rooms.js';
+import { schema, create, fedRoom, load, requireRoomAccess, receiveEvent, roomClient, roomSync, save } from './src/rooms.js';
 import { eventId, signPdu } from './src/graph.js';
 initSync({ module: readFileSync(new URL('./room-v10/pkg/relay_room_v10_bg.wasm', import.meta.url)) });
-for (const version of [10,11]) test(`private v${version} room checks invitations, signed state and join retries`, async () => {
+function memorySql() {
   const db = new DatabaseSync(':memory:');
-  const sql = {
+  return {
     exec(query, ...args) {
       if (query.includes(';')) {
         db.exec(query);
@@ -21,6 +21,9 @@ for (const version of [10,11]) test(`private v${version} room checks invitations
       return { toArray: () => rows, one: () => rows[0] };
     }
   };
+}
+for (const version of [10,11]) test(`private v${version} room checks invitations, signed state and join retries`, async () => {
+  const sql = memorySql();
   const server = 'worker.test',
     peer = 'synapse.test',
     user = '@a:' + server,
@@ -66,6 +69,49 @@ for (const version of [10,11]) test(`private v${version} room checks invitations
   const keys = {[peer]:{'ed25519:1':remote.publicKey},[server]:{'ed25519:1':identity.publicKey}};
   assert.ok(resolveJoin(room,keys,base,[],version).some(([type,key,id]) =>
     type === 'm.room.member' && key === other && id === eventId(p,version)));
+  // A branch forked before the remote join, then merged with the join. The
+  // new home knows the join snapshot but has never seen the old messages.
+  const remoteSql = memorySql();
+  schema(remoteSql);
+  const replica = {...home,sql:remoteSql,identity:remote,
+    env:{PEER_KEYS:{[server]:{'ed25519:1':identity.publicKey}},PEER_URLS:{[server]:'https://worker.test'}}};
+  for (const [pos,e] of base.auth.entries())
+    remoteSql.exec('INSERT INTO room_outliers VALUES(?,?,?,?)',room,eventId(e,version),pos,JSON.stringify(e));
+  const joinId = eventId(p,version);
+  remoteSql.exec('INSERT INTO room_bases VALUES(?,?,?)',room,joinId,JSON.stringify(base.stateIds));
+  const snapshot = new Map(resolveJoin(room,keys,base,[],version).map(([t,k,id])=>[JSON.stringify([t,k]),id]));
+  save(replica,{room,version,state:snapshot,tips:new Set([joinId])},[p]);
+  const origin = load(home,server,room);
+  const oldTimeline = [...origin.events.entries()].filter(([id])=>id!==joinId).map(([,e])=>e);
+  const hidden = {...origin.template(user,'m.room.message',{msgtype:'m.text',body:'Before join'}),
+    prev_events:p.prev_events, depth:p.depth};
+  const oldMessage = await signPdu(identity,server,hidden,version);
+  const successor = await signPdu(identity,server,{...origin.template(user,'m.room.message',{msgtype:'m.text',body:'After merge'}),
+    prev_events:[joinId,eventId(oldMessage,version)],depth:p.depth+1},version);
+  const {recoverPredecessors:recover} = await import('./src/gaps.js');
+  const proof = await recover(replica,peer,server,successor,async()=>Response.json({events:[...oldTimeline,oldMessage]}));
+  const actualState = base.stateIds;
+  remoteSql.exec('UPDATE room_bases SET state_ids=? WHERE room=?',JSON.stringify(actualState.slice(1)),room);
+  await assert.rejects(receiveEvent(replica,peer,server,successor,proof),/disagrees/);
+  assert.equal(remoteSql.exec('SELECT COUNT(*) AS n FROM room_ancestry').one().n,0);
+  remoteSql.exec('UPDATE room_bases SET state_ids=? WHERE room=?',JSON.stringify(actualState),room);
+  await receiveEvent(replica,peer,server,successor,proof);
+  const visible = await roomClient(replica,peer,{user_id:other},'GET',[room,'messages'],null,new URLSearchParams({dir:'b'}));
+  assert.deepEqual(visible.body.chunk.map(e=>e.event_id),[eventId(successor,version),joinId]);
+  assert.deepEqual([...load(replica,peer,room).tips],[eventId(successor,version)]);
+  const priorId = eventId(oldMessage,version);
+  const stateParams = new URLSearchParams({event_id:priorId});
+  const priorIds = (await fedRoom(replica,peer,server,'GET',['state_ids',room],stateParams)).body;
+  const priorState = (await fedRoom(replica,peer,server,'GET',['state',room],stateParams)).body;
+  assert.deepEqual(priorIds.pdu_ids,priorState.pdus.map(e=>eventId(e,version)));
+  assert.deepEqual(priorIds.auth_chain_ids,priorState.auth_chain.map(e=>eventId(e,version)));
+  assert.equal(priorState.pdus.find(e=>e.type==='m.room.member' && e.state_key===other).content.membership,'invite');
+  assert.ok((await fedRoom(replica,peer,server,'GET',['event_auth',room,priorId],stateParams)).body.auth_chain.length);
+  await assert.rejects(fedRoom(replica,peer,'stranger.test','GET',['state_ids',room],stateParams));
+  const early = oldTimeline.find(e=>e.type==='m.room.message');
+  const preJoin = (await fedRoom(home,server,peer,'GET',['backfill',room],
+    new URLSearchParams({v:eventId(early,version),limit:'1'}))).body;
+  assert.equal(preJoin.pdus[0].content.body,undefined);
   const dated = until => ({...keys,[peer]:{'ed25519:1':{key:remote.publicKey,until}}});
   assert.deepEqual(resolveJoin(room,dated(p.origin_server_ts),base,[],version),
     resolveJoin(room,keys,base,[],version));

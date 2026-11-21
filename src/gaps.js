@@ -12,13 +12,14 @@ const byteSize = new TextEncoder();
 
 // Walk the signed tip's ancestry iteratively: a long offline interval can exceed
 // the JavaScript call stack. Only reachable events enter the returned batch.
-function predecessors(graph, tip, head, pool) {
+function predecessors(graph, tip, head, pool, base) {
   const ordered = [], needs = new Set(), seen = new Set(), visiting = new Set();
   const stack = tip.prev_events.map(id => [id, head, false]);
+  if (base) stack.push(...base.join.prev_events.map(id=>[id,eventId(base.join,graph.version),false]));
   while (stack.length) {
     const [id, child, expanded] = stack.pop();
-    if (seen.has(id) || graph.events.has(id)) continue;
-    const event = pool.get(id);
+    if (seen.has(id) || graph.knownPredecessor(id)) continue;
+    const event = pool.get(id) ?? graph.events.get(id);
     if (!event) { needs.add(child); continue; }
     if (expanded) {
       visiting.delete(id);
@@ -58,7 +59,7 @@ export async function recoverPredecessors(home, server, peer, pdu, request = rem
   if (
     !graph.tips.size ||
     !Array.isArray(pdu.prev_events) ||
-    pdu.prev_events.every((id) => graph.events.has(id))
+    pdu.prev_events.every((id) => graph.knownPredecessor(id))
   )
     return [];
   requireRoomAccess(graph.get('m.room.server_acl'), peer);
@@ -82,7 +83,16 @@ export async function recoverPredecessors(home, server, peer, pdu, request = rem
     pool.set(eid,JSON.parse(raw));
     bytesRemaining -= bytes;
   }
-  let {ordered,needs} = predecessors(graph,pdu,head,pool);
+  const base = graph.events.joinBase?.();
+  // An auth outlier alone has no verified predecessor state. If the branch
+  // reaches room creation independently of our join, recover our join's
+  // signed ancestry too and compare it to the originally accepted snapshot.
+  function walk() {
+    const path = predecessors(graph,pdu,head,pool);
+    return base && path.ordered.some(event => event.type === 'm.room.create')
+      ? predecessors(graph,pdu,head,pool,base) : path;
+  }
+  let {ordered,needs} = walk();
   if (!needs.size) return ordered;
   let frontier = [...needs];
   const roots = [...graph.tips];
@@ -110,7 +120,7 @@ export async function recoverPredecessors(home, server, peer, pdu, request = rem
         added = true;
       }
     }
-    ({ordered,needs} = predecessors(graph,pdu,head,pool));
+    ({ordered,needs} = walk());
     if (!needs.size) return ordered;
     if (!added || needs.size > 256) throw Error('Incomplete predecessor chain');
     frontier = [...needs];

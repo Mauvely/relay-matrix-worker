@@ -69,13 +69,19 @@ function audienceAt(sql, graph, id, groups) {
   return groups.get(key);
 }
 
-export function disclosedEvent(sql, graph, peer, id, pdu, groups = new Map()) {
-  const { unsigned, ...signed } = pdu;
+export function canReadEvent(sql, graph, peer, id, pdu, groups = new Map()) {
+  if (!graph.knownPredecessor(id)) return false;
   let disclose = visible(audienceAt(sql, graph, id, groups), peer) ||
     (pdu.type === 'm.room.member' && domain(pdu.state_key) === peer);
   if (!disclose && pdu.type === 'm.room.history_visibility' && pdu.state_key === '')
     disclose = visible(audience(graph.before(pdu.prev_events)), peer);
-  return disclose ? signed : JSON.parse(redact_event(JSON.stringify(signed), graph.version));
+  return disclose;
+}
+
+export function disclosedEvent(sql, graph, peer, id, pdu, groups = new Map()) {
+  const { unsigned, ...signed } = pdu;
+  return canReadEvent(sql,graph,peer,id,pdu,groups)
+    ? signed : JSON.parse(redact_event(JSON.stringify(signed), graph.version));
 }
 
 export function missingEvents(sql, graph, peer, body, includeLatest = false) {
@@ -92,8 +98,8 @@ export function missingEvents(sql, graph, peer, body, includeLatest = false) {
     throw Object.assign(Error('Invalid history request'), { status: 400, errcode: 'M_INVALID_PARAM' });
   const groups = new Map();
   const timeline = (id) => {
-    const row = sql.exec('SELECT pdu FROM room_events WHERE room=? AND eid=?', graph.room, id).toArray()[0];
-    return row && JSON.parse(row.pdu);
+    if (!graph.knownPredecessor(id)) return undefined;
+    return graph.events.get(id);
   };
   const seen = new Set(includeLatest ? earliest : [...earliest, ...latest]);
   const queue = includeLatest ? latest.filter(id => !graph.softFailed.has(id))

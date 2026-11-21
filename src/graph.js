@@ -34,8 +34,9 @@ export async function signPdu(identity, server, pdu, version = 10) {
   };
 }
 export class RoomGraph {
-  constructor(room, keys, rows = [], stored, base, version = 10, softFailed = new Set()) {
+  constructor(room, keys, rows = [], stored, base, version = 10, softFailed = new Set(), historyIds = new Set()) {
     this.softFailed = softFailed;
+    this.historyIds = historyIds;
     this.base = base;
     this.version = version;
     this.room = room;
@@ -48,15 +49,15 @@ export class RoomGraph {
       return;
     }
     this.events = new Map(rows.map(({ eid, pdu }) => [eid, JSON.parse(pdu)]));
-    this.tips = new Set([...this.events.keys()].filter(id => !this.softFailed.has(id)));
+    this.tips = new Set([...this.events.keys()].filter(id => !this.softFailed.has(id) && !historyIds.has(id)));
     for (const [id,event] of this.events) {
-      if (!this.softFailed.has(id)) for (const prev of event.prev_events) this.tips.delete(prev);
+      if (!this.softFailed.has(id) && !historyIds.has(id)) for (const prev of event.prev_events) this.tips.delete(prev);
     }
     this.resolve();
   }
   resolve(tips = this.tips) {
     this.unchangedState = false;
-    const events = this.softFailed.size ? this.ancestry(tips) : [...this.events.values()];
+    const events = this.softFailed.size || this.historyIds.size || this.events.complete ? this.ancestry(tips) : [...this.events.values()];
     const state = this.resolved(events);
     this.state = new Map(state.map(([type, key, id]) => [JSON.stringify([type, key]), id]));
   }
@@ -66,6 +67,9 @@ export class RoomGraph {
     const anchor = eventId(base.join,this.version);
     if (!events.some((p) => eventId(p,this.version) === anchor)) throw Error('Missing history before the join anchor');
     return resolveJoin(this.room,this.keys,base,events.filter((p) => eventId(p,this.version) !== anchor),this.version);
+  }
+  knownPredecessor(id) {
+    return this.events.knownPredecessor ? this.events.knownPredecessor(id) : this.events.has(id);
   }
   get(type, key = '') {
     return this.events.get(this.state.get(JSON.stringify([type, key])));

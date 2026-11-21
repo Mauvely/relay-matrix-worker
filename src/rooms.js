@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 import { canonical } from './identity.js';
-import { disclosedEvent, saveAudience, missingEvents } from './history.js';
+import { canReadEvent, disclosedEvent, saveAudience, missingEvents } from './history.js';
 import { acl_allows } from '../room-v10/pkg/relay_room_v10.js';
 import { verificationKeys } from './identity.js';
 import { StoredEvents } from './stored-events.js';
@@ -18,6 +18,7 @@ const unready = (msg) => fail(503, 'M_UNAVAILABLE', msg);
 export const isObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
 export function schema(sql) {
   sql.exec(`CREATE TABLE IF NOT EXISTS room_events(seq INTEGER PRIMARY KEY AUTOINCREMENT,room TEXT,eid TEXT UNIQUE,pdu TEXT);
+    CREATE TABLE IF NOT EXISTS room_ancestry(seq INTEGER PRIMARY KEY,room TEXT NOT NULL,eid TEXT NOT NULL,UNIQUE(room,eid));
     CREATE TABLE IF NOT EXISTS room_soft_failures(room TEXT,eid TEXT,PRIMARY KEY(room,eid));
     CREATE VIEW IF NOT EXISTS room_client_events AS SELECT seq,room,eid,pdu FROM room_events e
       WHERE NOT EXISTS(SELECT 1 FROM room_soft_failures f WHERE f.room=e.room AND f.eid=e.eid);
@@ -38,6 +39,7 @@ export function schema(sql) {
     CREATE TABLE IF NOT EXISTS room_tx(id TEXT PRIMARY KEY,eid TEXT);
     CREATE TABLE IF NOT EXISTS outbound(id TEXT PRIMARY KEY,server TEXT,peer TEXT,path TEXT,content TEXT);
     CREATE TABLE IF NOT EXISTS received(id TEXT PRIMARY KEY,response TEXT);
+    CREATE TABLE IF NOT EXISTS federation_delivery_failures(peer TEXT PRIMARY KEY,events INTEGER NOT NULL,last_at INTEGER NOT NULL);
     CREATE TABLE IF NOT EXISTS retry(id TEXT PRIMARY KEY,attempt INTEGER NOT NULL,due INTEGER NOT NULL);
     CREATE TABLE IF NOT EXISTS user_data(seq INTEGER PRIMARY KEY AUTOINCREMENT,user TEXT,kind TEXT,content TEXT,UNIQUE(user,kind));`);
 }
@@ -92,6 +94,10 @@ async function checkParties(home, server, g) {
 }
 export function save(home, g, pdus) {
   if (g.version === 11) home.sql.exec('INSERT OR IGNORE INTO room_versions VALUES(?,?)',g.room,g.version);
+  for (const [id,event] of g.events?.pendingHistory ?? []) {
+    home.sql.exec('INSERT OR IGNORE INTO room_outliers VALUES(?,?,?,?)',g.room,id,-1,JSON.stringify(event));
+    home.sql.exec('INSERT OR IGNORE INTO room_ancestry(room,eid) VALUES(?,?)',g.room,id);
+  }
   let firstInserted;
   let lastInserted;
   for (const p of pdus) {
@@ -433,6 +439,17 @@ export async function roomClient(home, server, auth, method, parts, data, params
     action === 'join' ? { room_id: room } : action === 'send' || action === 'state' ? { event_id: id } : {}
   );
 }
+function authChain(graph,events) {
+  const ids = new Set(), pending = events.flatMap(event => event.auth_events);
+  while (pending.length) {
+    const id = pending.pop();
+    if (ids.has(id)) continue;
+    ids.add(id);
+    pending.push(...graph.events.get(id).auth_events);
+  }
+  return [...ids];
+}
+
 export async function fedRoom(home, server, peer, method, parts, params, body) {
   const [action, room, value] = parts,
     g = load(home, server, room);
@@ -457,6 +474,23 @@ export async function fedRoom(home, server, peer, method, parts, params, body) {
       pdus = missingEvents(home.sql,g,peer,{earliest_events:[],latest_events:v,limit:Number(limit)},true);
     }
     return ok({origin:server,origin_server_ts:Date.now(),pdus});
+  }
+  if (method === 'GET' && ['state','state_ids','event_auth'].includes(action)) {
+    if (!g.members('join').some(e => domain(e.state_key)===peer)) denied('Server is not joined');
+    const id = action === 'event_auth' ? value : params.get('event_id');
+    const event = g.events.get(id);
+    if (!event) missing();
+    if (!canReadEvent(home.sql,g,peer,id,event)) denied('Room history is unavailable at this event');
+    const cache = new Map();
+    const disclose = eid => disclosedEvent(home.sql,g,peer,eid,g.events.get(eid),cache);
+    if (action === 'event_auth') return ok({auth_chain:authChain(g,[event]).map(disclose)});
+    const base = g.events.joinBase?.();
+    const state = base && eventId(base.join,g.version) === id
+      ? base.stateIds.map(eid => g.events.get(eid))
+      : event.prev_events.length ? g.before(event.prev_events) : [];
+    const stateIds = state.map(e => eventId(e,g.version)), authIds = authChain(g,state);
+    return action === 'state_ids' ? ok({pdu_ids:stateIds,auth_chain_ids:authIds})
+      : ok({pdus:stateIds.map(disclose),auth_chain:authIds.map(disclose)});
   }
   if (action === 'make_join' && method === 'GET') {
     if (domain(value) !== peer) denied('Origin must own user');
@@ -487,19 +521,11 @@ export async function fedRoom(home, server, peer, method, parts, params, body) {
     const prior = home.sql.exec('SELECT response FROM received WHERE id=?', cache).toArray()[0];
     if (prior) return ok(JSON.parse(prior.response));
     const state = g.before(body.prev_events);
-    const ids = new Set(),
-      pending = state.flatMap((e) => e.auth_events);
-    while (pending.length) {
-      const id = pending.pop();
-      if (!ids.has(id)) {
-        ids.add(id);
-        pending.push(...g.events.get(id).auth_events);
-      }
-    }
+    const ids = authChain(g,state);
     const result = {
       origin: server,
       state,
-      auth_chain: [...ids].map((id) => g.events.get(id)),
+      auth_chain: ids.map((id) => g.events.get(id)),
       event: body,
       members_omitted: false
     };
@@ -518,20 +544,54 @@ export async function fedRoom(home, server, peer, method, parts, params, body) {
   missing();
 }
 
+// Old branches are proof for state resolution. Keep their bodies outside the
+// client stream, including when they arrive after the local membership event.
+async function attachHistory(home,server,graph,incoming) {
+  const store = graph.events;
+  if (!store.joinBase || (!store.complete && !incoming.some(p=>p.type==='m.room.create'))) return incoming;
+  if (incoming.length === 1 && incoming[0].prev_events.some(id => store.inTimeline(id))) return incoming;
+  const original = store.joinBase(true);
+  if (!original) return incoming;
+  const timeline = [], activeIds = new Set();
+  for (const event of incoming) {
+    if (event.room_id !== graph.room) invalid('Room ID mismatch');
+    const id = eventId(event,graph.version);
+    if (store.knownPredecessor(id)) continue;
+    if (event.prev_events.some(parent => activeIds.has(parent) || store.inTimeline(parent))) {
+      activeIds.add(id);
+      timeline.push(event);
+    } else {
+      const author = domain(event.sender);
+      if (author !== server) graph.keys[author] = await keysForEvent(home,author,event);
+      store.pendingHistory.set(id,event);
+    }
+  }
+  if (!store.pendingHistory.size) return timeline;
+  const wasComplete = store.complete;
+  store.complete = true;
+  graph.resolved([...store.historyRows().map(r=>JSON.parse(r.pdu)),...store.pendingHistory.values()]);
+  if (!wasComplete) {
+    const actual = graph.resolved(graph.ancestry(original.join.prev_events)).map(([, , id])=>id);
+    const expected = new Set(original.stateIds);
+    if (actual.length !== expected.size || actual.some(id => !expected.has(id)))
+      invalid('Recovered history disagrees with verified join state');
+  }
+  return timeline;
+}
 export async function receiveEvent(home, server, peer, pdu, recovered = []) {
   const g = load(home, server, pdu.room_id);
   if (!g.tips.size || !g.members('join').some((e) => domain(e.state_key) === server)) missing();
   requireRoomAccess(g.get('m.room.server_acl'),peer);
-  if (g.events.has(eventId(pdu,g.version))) return;
+  if (g.knownPredecessor(eventId(pdu,g.version))) return;
   if (!g.members('join').some((m) => domain(m.state_key) === peer)) denied('Sending server is not resident');
   await checkParties(home, server, g);
   const additions = [];
-  for (const event of [...recovered,pdu]) {
+  for (const event of await attachHistory(home,server,g,[...recovered,pdu])) {
     if (event.room_id !== g.room) invalid('Room ID mismatch');
     if (g.events.has(eventId(event,g.version))) continue;
     requireRoomAccess(g.get('m.room.server_acl'),peer);
     requireRoomAccess(g.get('m.room.server_acl'),domain(event.sender));
-    if (!Array.isArray(event.prev_events) || event.prev_events.some((id) => !g.events.has(id)))
+    if (!Array.isArray(event.prev_events) || event.prev_events.some((id) => !g.knownPredecessor(id)))
       unready('Missing predecessor');
     if (event.type === 'm.room.member') await openParty(home,server,event.state_key);
     const author = domain(event.sender);
@@ -541,7 +601,7 @@ export async function receiveEvent(home, server, peer, pdu, recovered = []) {
     g.add(event,softFailed);
     additions.push(event);
   }
-  if (additions.length) commit(home,server,g,additions);
+  if (additions.length || g.events.pendingHistory?.size) commit(home,server,g,additions);
 }
 // The timeline is in local stream order. Its starting state must reflect all branches
 // already committed at that point, including when an older device missed a fork.
@@ -559,8 +619,11 @@ function stateBeforeStream(home, server, room, firstSeq) {
   const keys = { ...graphKeys(home), [server]: verificationKeys(home.identity) };
   const store = new StoredEvents(home.sql, room);
   const base = store.joinBase();
-  if (base && !prior.length) return base.stateIds.map((id) => clientEvent(store.get(id),id));
-  const prefix = new RoomGraph(room, keys, prior, undefined, base,roomVersion(home.sql,room),softFailures(home.sql,room));
+  const original = base ?? store.joinBase(true);
+  if (original && !prior.length) return original.stateIds.map((id) => clientEvent(store.get(id),id));
+  const history = store.complete ? store.historyRows() : [];
+  const prefix = new RoomGraph(room, keys, [...history,...prior], undefined, base,roomVersion(home.sql,room),
+    softFailures(home.sql,room),new Set(history.map(row=>row.eid)));
   return [...prefix.state.values()].map((id) => clientEvent(prefix.events.get(id) ?? store.get(id), id));
 }
 export async function roomSync(home, server, user, cursor, initial) {
