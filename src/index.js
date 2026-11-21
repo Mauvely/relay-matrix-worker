@@ -9,7 +9,7 @@ import { clientApi, federationApi } from './api.js';
 import { getRemote, limited, mediaSchema, mediaRoute } from './media.js';
 import { openParty, queue, schema, roomSync } from './rooms.js';
 import { authenticatedOrigin, remote, authenticateQuery } from './federation.js';
-import { delegated, ensureManagedAccount, login, provision, session } from './accounts.js';
+import { delegated, ensureManagedAccount, issueLoginCode, redeemLoginCode, ssoRedirect, login, provision, session } from './accounts.js';
 import { replayProbe, verifyFixtureHistory } from './probe.js';
 import { DurableObject, WorkerEntrypoint } from 'cloudflare:workers';
 import { discoverPeer } from './discovery.js';
@@ -17,6 +17,14 @@ import { canonical, createIdentity, signServerKeys } from './identity.js';
 
 // Private RPC binding for the account owner. The public fetch handler has no equivalent route.
 export class AccountDirectory extends WorkerEntrypoint {
+  async grant(server, accountId, redirect) {
+    const endpoint = this.env.ACCOUNT_ENDPOINT;
+    const target = ssoRedirect(redirect, this.env.SSO_CLIENTS);
+    if (!endpoint || this.env.DOMAINS?.[endpoint] !== server || !target) throw Error('Matrix sign-in unavailable');
+    target.searchParams.set('loginToken', await this.env.HOMESERVERS.getByName(server).loginCode(accountId));
+    return target.href;
+  }
+
   async ensure(server, accountId, localpart, organisationId) {
     const endpoint = this.env.ACCOUNT_ENDPOINT;
     if (!endpoint || this.env.DOMAINS?.[endpoint] !== server || !(await delegated(server, endpoint)))
@@ -38,6 +46,7 @@ export class Homeserver extends DurableObject {
     this.discoveredKeys = Object.create(null);
     for (const row of this.sql.exec('SELECT name,record FROM federation_peers').toArray())
       this.discoveredKeys[row.name] = JSON.parse(row.record).keys;
+    this.sql.exec('CREATE TABLE IF NOT EXISTS sso_codes(hash TEXT PRIMARY KEY,user TEXT NOT NULL,expires INTEGER NOT NULL)');
     schema(this.sql);
     inviteSchema(this.sql);
     keySchema(this.sql);
@@ -211,8 +220,14 @@ export class Homeserver extends DurableObject {
     return provision(this.ctx.storage, server, localpart, organisationId);
   }
 
+  loginCode(accountId) {
+    return issueLoginCode(this.ctx.storage, this.sql, accountId);
+  }
+
   async login(server, data) {
-    const result = await login(this.ctx.storage, server, data);
+    const result = data?.type === 'm.login.token'
+      ? await redeemLoginCode(this.ctx.storage, this.sql, server, data)
+      : await login(this.ctx.storage, server, data);
     if (result.status === 200)
       this.sql.exec('INSERT OR IGNORE INTO devices VALUES (?,?)', result.body.user_id, result.body.device_id);
     return result;
@@ -455,8 +470,16 @@ export default {
       return json(!params.has('field') || params.get('field') === 'displayname' ? profile : {});
     }
     const client = /^\/_matrix\/client\/(?:v3|r0)\/(login|account\/whoami|logout)$/.exec(pathname)?.[1];
+    const managed = env.ACCOUNT_ENDPOINT === hostname;
     if (client === 'login' && request.method === 'GET')
-      return json({ flows: [{ type: 'm.login.password' }] });
+      return json({ flows: managed ? [{ type: 'm.login.sso' }, { type: 'm.login.token' }] : [{ type: 'm.login.password' }] });
+    if (managed && /^\/_matrix\/client\/(?:v3|r0)\/login\/sso\/redirect$/.test(pathname) && request.method === 'GET') {
+      const target = ssoRedirect(new URL(request.url).searchParams.get('redirectUrl'), env.SSO_CLIENTS);
+      if (!target) return json({errcode:'M_INVALID_PARAM', error:'Unsupported client return address'}, 400);
+      const approval = new URL('/matrix-signin', 'https://' + server);
+      approval.searchParams.set('client', target.href);
+      return Response.redirect(approval, 302);
+    }
     if (
       (client === 'account/whoami' && request.method === 'GET') ||
       (client === 'logout' && request.method === 'POST')

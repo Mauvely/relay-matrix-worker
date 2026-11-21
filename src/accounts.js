@@ -71,6 +71,10 @@ export async function login(storage, server, body) {
   const account = alphabet.test(local) && (await storage.get('account/' + local));
   if (!account || (await digest(body.password)) !== account.passwordHash)
     return matrixError(403, 'M_FORBIDDEN', 'Invalid credentials');
+  return startSession(storage, account, body);
+}
+
+async function startSession(storage, account, body) {
   const deviceId = body.device_id ?? crypto.randomUUID();
   if (typeof deviceId !== 'string' || !deviceId || deviceId.length > 255)
     return matrixError(400, 'M_INVALID_PARAM', 'Invalid device ID');
@@ -81,6 +85,37 @@ export async function login(storage, server, body) {
     organisationId: account.organisationId
   });
   return { status: 200, body: { user_id: account.userId, device_id: deviceId, access_token: token } };
+}
+
+export function ssoRedirect(address, clients) {
+  try {
+    const url = new URL(address);
+    if (url.username || url.password || url.searchParams.has('loginToken')) return null;
+    const loopback = url.protocol === 'http:' && ['127.0.0.1', '[::1]'].includes(url.hostname) && url.port;
+    return (loopback || clients?.includes(url.origin + url.pathname)) ? url : null;
+  } catch {
+    return null;
+  }
+}
+
+export async function issueLoginCode(storage, sql, accountId) {
+  const userId = await storage.get('mauvely-id/' + accountId);
+  if (!userId) throw Error('No bound account');
+  const token = secret();
+  const hash = await digest(token);
+  sql.exec('DELETE FROM sso_codes WHERE expires <= ?', Date.now());
+  sql.exec('INSERT INTO sso_codes VALUES(?,?,?)', hash, userId, Date.now() + 60000);
+  return token;
+}
+
+export async function redeemLoginCode(storage, sql, server, body) {
+  if (!/^[0-9a-f]{64}$/.test(body.token ?? '')) return matrixError(403, 'M_FORBIDDEN', 'Invalid login token');
+  const hash = await digest(body.token);
+  const rows = sql.exec('DELETE FROM sso_codes WHERE hash=? AND expires>? RETURNING user', hash, Date.now()).toArray();
+  const id = rows[0]?.user;
+  const account = id && id.endsWith(':' + server) && await storage.get('account/' + id.slice(1, -server.length - 1));
+  if (!account?.accountId || account.userId !== id) return matrixError(403, 'M_FORBIDDEN', 'Invalid login token');
+  return startSession(storage, account, body);
 }
 
 export async function session(storage, authorization, logout = false) {

@@ -64,3 +64,24 @@ test('directory retries retain the account owner and immutable Matrix ID', async
   await provision(db, 'testing.example', 'existing', null);
   await assert.rejects(ensure('usr_3', 'existing'));
 });
+
+test('SSO codes expire, can be redeemed once and cannot cross homeservers', async () => {
+  const { DatabaseSync } = await import('node:sqlite');
+  const { issueLoginCode, redeemLoginCode, ssoRedirect } = await import('./src/accounts.js');
+  const db = new DatabaseSync(':memory:');
+  db.exec('CREATE TABLE sso_codes(hash TEXT PRIMARY KEY,user TEXT NOT NULL,expires INTEGER NOT NULL)');
+  const sql = { exec(query, ...values) { const result = db.prepare(query).all(...values); return {toArray: () => result}; } };
+  const storage = store(), server = 'a.example';
+  await ensureManagedAccount(storage, server, 'usr_1', 'alex', null);
+  const code = await issueLoginCode(storage, sql, 'usr_1');
+  assert.equal((await redeemLoginCode(storage, sql, server, {token:code})).body.user_id, '@alex:a.example');
+  assert.equal((await redeemLoginCode(storage, sql, server, {token:code})).status, 403);
+  const old = await issueLoginCode(storage, sql, 'usr_1');
+  db.exec('UPDATE sso_codes SET expires=0');
+  assert.equal((await redeemLoginCode(storage, sql, server, {token:old})).status, 403);
+  const foreign = await issueLoginCode(storage, sql, 'usr_1');
+  assert.equal((await redeemLoginCode(storage, sql, 'b.example', {token:foreign})).status, 403);
+  assert.equal(ssoRedirect('https://unlisted.example/matrix', ['https://relay.example/matrix']), null);
+  assert.equal(ssoRedirect('https://relay.example/matrix?state=1', ['https://relay.example/matrix']).search, '?state=1');
+  db.close();
+});
