@@ -22,8 +22,8 @@ export async function delegated(name, endpoint, read = fetch) {
   if (!/^[a-z0-9.-]+$/.test(name) || !/^[a-z0-9.-]+$/.test(endpoint)) return false;
   async function record(kind) {
     const response = await read('https://' + name + '/.well-known/matrix/' + kind,
-      {redirect: 'error', signal: AbortSignal.timeout(5000)});
-    if (!response.ok) return null;
+      {redirect: 'manual', signal: AbortSignal.timeout(5000)});
+    if (!response.ok) throw Error(kind + ' discovery returned HTTP ' + response.status);
     return response.json();
   }
   const [client, server] = await Promise.all([record('client'), record('server')]);

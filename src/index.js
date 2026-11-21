@@ -58,9 +58,9 @@ export default {
       try { body = await request.json(); } catch { return json({errcode: 'M_BAD_JSON', error: 'Invalid JSON'}, 400); }
       if (provisioning) {
         try {
-          if (!await delegated(server, hostname)) throw Error();
-        } catch {
-          return json({errcode: 'M_FORBIDDEN', error: 'Domain delegation is unverified'}, 403);
+          if (!await delegated(server, hostname)) throw Error('Unexpected Matrix endpoint');
+        } catch (error) {
+          return json({errcode: 'M_FORBIDDEN', error: 'Domain delegation is unverified: ' + error.message}, 403);
         }
       }
       const result = provisioning ? await homeserver.provision(server, body?.localpart, body?.organisation_id)
