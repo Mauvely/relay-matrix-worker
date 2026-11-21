@@ -161,3 +161,24 @@ pub fn verify_signed_pdu(event: &str, keys: &str) -> Result<(),String> {
     }
     Ok(())
 }
+
+// The sole predecessor of a linear append has the room's already-committed state.
+// Use the same PDU verifier and both auth checks as replay, with that trusted prefix.
+#[wasm_bindgen]
+pub fn check_linear(event: &str, keys: &str, predecessor: &str, state: &str, auth: &str) -> Result<(), String> {
+    let obj: CanonicalJsonObject = serde_json::from_str(event).map_err(|e| e.to_string())?;
+    let keys = serde_json::from_str(keys).map_err(|e| e.to_string())?;
+    let predecessor = ruma_common::EventId::parse(predecessor).map_err(|e| e.to_string())?;
+    let entries: Vec<Pdu> = serde_json::from_str(state).map_err(|e| e.to_string())?;
+    let declared: Vec<Pdu> = serde_json::from_str(auth).map_err(|e| e.to_string())?;
+    let mut trace = Trace::default();
+    let mut snapshot = State::new();
+    for p in entries {
+        let key = p.state_key.clone().ok_or("invalid state checkpoint")?;
+        snapshot.insert((StateEventType::from(p.kind.to_string()), key), p.event_id.clone());
+        trace.events.insert(p.event_id.clone(), p);
+    }
+    for p in declared { trace.events.insert(p.event_id.clone(), p); }
+    trace.states.insert(predecessor, snapshot);
+    trace.apply(obj, &keys)
+}

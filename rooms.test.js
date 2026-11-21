@@ -87,3 +87,31 @@ test('private v10 room requires an invitation and accepts a signed remote join e
   await assert.rejects(messages(user, { dir: 'b', from: '!another:server/9' }), /history token/);
   await assert.rejects(messages('@stranger:' + server, { dir: 'b' }), /membership/i);
 });
+
+test('linear rooms grow beyond 512 events without replaying every prior message', async () => {
+  const db = new DatabaseSync(':memory:');
+  let historyReads = 0;
+  const sql = {exec(q, ...args) {
+    if (q.includes(';')) return db.exec(q);
+    if (q.includes('SELECT eid,pdu FROM room_events WHERE room=? ORDER BY seq')) historyReads++;
+    const rows = db.prepare(q).all(...args);
+    return {toArray: () => rows, one: () => rows[0]};
+  }};
+  schema(sql);
+  const server = 'worker.example', user = '@grow:' + server;
+  const home = {sql, waiters:new Map(), identity: await createIdentity(), ctx:{storage:{transactionSync: fn => fn()}},
+    env:{}, party: async () => ({organisationId:null})};
+  const auth = {user_id:user,device_id:'TEST'};
+  const room = (await create(home,server,user,{})).body.room_id;
+  const baseline = historyReads;
+  let last;
+  for (let i=0; i<520; i++) last = await roomClient(home,server,auth,'PUT',[room,'send','m.room.message',String(i)],{msgtype:'m.text',body:String(i)});
+  assert.equal(last.status, 200);
+  assert.equal(historyReads,baseline);
+  const sync = await roomSync(home,server,user,0,true);
+  assert.equal(sync.rooms.join[room].timeline.events.at(-1).event_id,last.body.event_id);
+  const page = await roomClient(home,server,auth,'GET',[room,'messages'],undefined,new URLSearchParams({dir:'b',limit:'100'}));
+  assert.equal(page.body.chunk.length,100);
+  assert.ok(page.body.end);
+  db.close();
+});

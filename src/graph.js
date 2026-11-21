@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 import {
   check_current,
+  check_linear,
   auth_fields,
   prepare_event,
   reference_id,
@@ -31,15 +32,23 @@ export async function signPdu(identity, server, pdu) {
   };
 }
 export class RoomGraph {
-  constructor(room, keys, rows = []) {
+  constructor(room, keys, rows = [], stored) {
     this.room = room;
     this.keys = keys;
+    if (stored) {
+      this.events = stored.events;
+      this.tips = stored.tips;
+      this.state = stored.state;
+      this.unchangedState = true;
+      return;
+    }
     this.events = new Map(rows.map(({ eid, pdu }) => [eid, JSON.parse(pdu)]));
     this.tips = new Set(this.events.keys());
     for (const event of this.events.values()) for (const id of event.prev_events) this.tips.delete(id);
     this.resolve();
   }
   resolve() {
+    this.unchangedState = false;
     const state = JSON.parse(replay(JSON.stringify([...this.events.values()]), JSON.stringify(this.keys)));
     this.state = new Map(state.map(([type, key, id]) => [JSON.stringify([type, key]), id]));
   }
@@ -72,6 +81,8 @@ export class RoomGraph {
     return pdu;
   }
   before(parents) {
+    if (parents.length === this.tips.size && [...this.tips].every((id) => parents.includes(id)))
+      return [...this.state.values()].map((id) => this.events.get(id));
     const ancestors = new Set(),
       pending = [...parents];
     while (pending.length) {
@@ -96,9 +107,23 @@ export class RoomGraph {
     if (pdu.room_id !== this.room) throw Error('Room ID mismatch');
     const id = eventId(pdu);
     if (this.events.has(id)) return;
-    if (this.events.size >= 512) throw Error('Room reached spike history limit');
-    this.events.set(id, pdu);
-    this.resolve();
+    if (this.tips.size === 1 && pdu.prev_events?.length === 1 && this.tips.has(pdu.prev_events[0])) {
+      const checked = (id) => {
+        const event = this.events.get(id);
+        if (!event) throw Error('Missing authorization event');
+        return { ...event, event_id: id };
+      };
+      check_linear(JSON.stringify(pdu), JSON.stringify(this.keys), pdu.prev_events[0],
+        JSON.stringify([...this.state.values()].map(checked)), JSON.stringify(pdu.auth_events.map(checked)));
+      this.events.set(id, pdu);
+      if (pdu.state_key !== undefined) {
+        this.unchangedState = false;
+        this.state.set(JSON.stringify([pdu.type, pdu.state_key]), id);
+      }
+    } else {
+      this.events.set(id, pdu);
+      try { this.resolve(); } catch (error) { this.events.delete(id); throw error; }
+    }
     for (const prev of pdu.prev_events) this.tips.delete(prev);
     this.tips.add(id);
   }

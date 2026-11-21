@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
+import { StoredEvents } from './stored-events.js';
 import { graphKeys, peerRecord } from './discovery.js';
 import { clientEvent, domain, eventId, RoomGraph } from './graph.js';
 
@@ -15,6 +16,7 @@ export function schema(sql) {
   sql.exec(`CREATE TABLE IF NOT EXISTS room_events(seq INTEGER PRIMARY KEY AUTOINCREMENT,room TEXT,eid TEXT UNIQUE,pdu TEXT);
     CREATE INDEX IF NOT EXISTS room_history ON room_events(room,seq);
     CREATE TABLE IF NOT EXISTS room_state(room TEXT,kind TEXT,skey TEXT,eid TEXT,PRIMARY KEY(room,kind,skey));
+    CREATE TABLE IF NOT EXISTS room_tips(room TEXT,eid TEXT,PRIMARY KEY(room,eid));
     CREATE TABLE IF NOT EXISTS room_tx(id TEXT PRIMARY KEY,eid TEXT);
     CREATE TABLE IF NOT EXISTS outbound(id TEXT PRIMARY KEY,server TEXT,peer TEXT,path TEXT,content TEXT);
     CREATE TABLE IF NOT EXISTS received(id TEXT PRIMARY KEY,response TEXT);
@@ -22,11 +24,22 @@ export function schema(sql) {
     CREATE TABLE IF NOT EXISTS user_data(seq INTEGER PRIMARY KEY AUTOINCREMENT,user TEXT,kind TEXT,content TEXT,UNIQUE(user,kind));`);
 }
 function load(home, server, room) {
-  return new RoomGraph(
-    room,
-    { ...graphKeys(home), [server]: { 'ed25519:1': home.identity.publicKey } },
-    home.sql.exec('SELECT eid,pdu FROM room_events WHERE room=? ORDER BY seq', room).toArray()
-  );
+  const sql = home.sql;
+  const keys = { ...graphKeys(home), [server]: { 'ed25519:1': home.identity.publicKey } };
+  const tips = new Set(sql.exec('SELECT eid FROM room_tips WHERE room=?', room).toArray().map((r) => r.eid));
+  if (!tips.size) {
+    // Rooms from before the checkpoint schema have at most 512 PDUs. Rebuild their tips once.
+    const rows = sql.exec('SELECT eid,pdu FROM room_events WHERE room=? ORDER BY seq', room).toArray();
+    const graph = new RoomGraph(room, keys, rows);
+    if (rows.length) home.ctx.storage.transactionSync(() => {
+      for (const id of graph.tips) sql.exec('INSERT OR IGNORE INTO room_tips VALUES(?,?)', room, id);
+    });
+    return graph;
+  }
+  const state = new Map(sql.exec('SELECT kind,skey,eid FROM room_state WHERE room=?', room).toArray()
+    .map((r) => [JSON.stringify([r.kind, r.skey]), r.eid]));
+  return new RoomGraph(room, keys, [], {state, tips, events: new StoredEvents(sql, room)});
+
 }
 // Until managed-room reconciliations can run atomically, these new live room routes
 // admit only personal and explicitly open accounts. Existing device rules still apply.
@@ -57,6 +70,9 @@ export function save(home, g, pdus) {
       eventId(p),
       JSON.stringify(p)
     );
+  home.sql.exec('DELETE FROM room_tips WHERE room=?', g.room);
+  for (const tip of g.tips) home.sql.exec('INSERT INTO room_tips VALUES(?,?)', g.room, tip);
+  if (g.unchangedState) return;
   home.sql.exec('DELETE FROM room_state WHERE room=?', g.room);
   for (const [key, id] of g.state)
     home.sql.exec('INSERT INTO room_state VALUES(?,?,?,?)', g.room, ...JSON.parse(key), id);
@@ -221,7 +237,7 @@ function messagePage(home, room, joinId, params) {
   const rows = home.sql
     .exec(
       'SELECT seq,eid,pdu FROM room_events WHERE room=? AND seq>=? AND seq<? ORDER BY seq ' +
-        (backwards ? 'DESC' : 'ASC'),
+        (backwards ? 'DESC' : 'ASC') + ' LIMIT 101',
       room,
       Math.max(floor, backwards ? to : from),
       Math.min(ceiling, backwards ? from : to)
@@ -246,7 +262,10 @@ function messagePage(home, room, joinId, params) {
     });
   const page = [];
   let last;
+  let more = false;
   for (const row of rows) {
+    if (page.length >= Math.min(limit, 100) || (rows.length === 101 && row === rows[100])) { more = true; break; }
+    last = row.seq;
     const e = clientEvent(JSON.parse(row.pdu), row.eid);
     if (
       (filter.types && !matches(filter.types, e.type, true)) ||
@@ -258,15 +277,13 @@ function messagePage(home, room, joinId, params) {
       ('contains_url' in filter && filter.contains_url !== (typeof e.content?.url === 'string'))
     )
       continue;
-    if (page.length >= Math.min(limit, 100)) break;
-    last = row.seq;
+
     page.push(e);
   }
-  const more = last !== undefined && rows.at(-1)?.seq !== last;
   return ok({
     start: pageToken(room, from),
     chunk: page,
-    ...(more ? { end: pageToken(room, backwards ? last : last + 1) } : {})
+    ...(more && last !== undefined ? { end: pageToken(room, backwards ? last : last + 1) } : {})
   });
 }
 
@@ -275,7 +292,7 @@ export async function roomClient(home, server, auth, method, parts, data, params
     user = auth.user_id;
   await openParty(home, server, user);
   const g = load(home, server, room);
-  if (!g.events.size) missing();
+  if (!g.tips.size) missing();
   await checkParties(home, server, g);
   const membership = g.get('m.room.member', user)?.content.membership;
   if (method === 'POST' && action === 'join' && membership === 'join') return ok({ room_id: room });
@@ -334,7 +351,7 @@ export async function roomClient(home, server, auth, method, parts, data, params
 export async function fedRoom(home, server, peer, method, parts, params, body) {
   const [action, room, value] = parts,
     g = load(home, server, room);
-  if (!g.events.size) missing();
+  if (!g.tips.size) missing();
   await checkParties(home, server, g);
   if (g.get('m.room.create')?.content['m.federate'] === false) denied('Federation disabled');
   if (action === 'make_join' && method === 'GET') {
@@ -400,7 +417,7 @@ export async function fedRoom(home, server, peer, method, parts, params, body) {
 export async function receiveEvent(home, server, peer, pdu) {
   if (domain(pdu.sender) !== peer) denied('Unsupported relayed origin');
   const g = load(home, server, pdu.room_id);
-  if (!g.events.size || !g.members('join').some((e) => domain(e.state_key) === server)) missing();
+  if (!g.tips.size || !g.members('join').some((e) => domain(e.state_key) === server)) missing();
   if (g.events.has(eventId(pdu))) return;
   await checkParties(home, server, g);
   if (g.get('m.room.member', pdu.sender)?.content.membership !== 'join')
