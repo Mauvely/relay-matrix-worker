@@ -15,24 +15,34 @@ const unready = (msg) => fail(503, 'M_UNAVAILABLE', msg);
 export const isObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
 export function schema(sql) {
   sql.exec(`CREATE TABLE IF NOT EXISTS room_events(seq INTEGER PRIMARY KEY AUTOINCREMENT,room TEXT,eid TEXT UNIQUE,pdu TEXT);
+    CREATE TABLE IF NOT EXISTS room_versions(room TEXT PRIMARY KEY,version INTEGER NOT NULL);
+    CREATE TABLE IF NOT EXISTS room_outliers(room TEXT,eid TEXT PRIMARY KEY,position INTEGER,pdu TEXT);
+    CREATE INDEX IF NOT EXISTS room_outlier_order ON room_outliers(room,position);
+    CREATE TABLE IF NOT EXISTS room_bases(room TEXT PRIMARY KEY,join_id TEXT,state_ids TEXT);
+    CREATE VIEW IF NOT EXISTS room_known_events AS SELECT room,eid,pdu FROM room_events UNION ALL SELECT room,eid,pdu FROM room_outliers;
     CREATE INDEX IF NOT EXISTS room_history ON room_events(room,seq);
     CREATE TABLE IF NOT EXISTS room_state(room TEXT,kind TEXT,skey TEXT,eid TEXT,PRIMARY KEY(room,kind,skey));
     CREATE TABLE IF NOT EXISTS room_checkpoints(room TEXT,first_seq INTEGER,last_seq INTEGER,state TEXT,PRIMARY KEY(room,last_seq));
     CREATE TABLE IF NOT EXISTS room_tips(room TEXT,eid TEXT,PRIMARY KEY(room,eid));
+    CREATE TABLE IF NOT EXISTS profile_updates(server TEXT,user TEXT,room TEXT,due INTEGER DEFAULT 0,PRIMARY KEY(user,room));
     CREATE TABLE IF NOT EXISTS room_tx(id TEXT PRIMARY KEY,eid TEXT);
     CREATE TABLE IF NOT EXISTS outbound(id TEXT PRIMARY KEY,server TEXT,peer TEXT,path TEXT,content TEXT);
     CREATE TABLE IF NOT EXISTS received(id TEXT PRIMARY KEY,response TEXT);
     CREATE TABLE IF NOT EXISTS retry(id TEXT PRIMARY KEY,attempt INTEGER NOT NULL,due INTEGER NOT NULL);
     CREATE TABLE IF NOT EXISTS user_data(seq INTEGER PRIMARY KEY AUTOINCREMENT,user TEXT,kind TEXT,content TEXT,UNIQUE(user,kind));`);
 }
-function load(home, server, room) {
+export function roomVersion(sql, room) {
+  return sql.exec('SELECT version FROM room_versions WHERE room=?', room).toArray()[0]?.version ?? 10;
+}
+export function load(home, server, room) {
+  const version = roomVersion(home.sql,room);
   const sql = home.sql;
   const keys = { ...graphKeys(home), [server]: verificationKeys(home.identity) };
   const tips = new Set(sql.exec('SELECT eid FROM room_tips WHERE room=?', room).toArray().map((r) => r.eid));
   if (!tips.size) {
     // Rooms from before the checkpoint schema have at most 512 PDUs. Rebuild their tips once.
     const rows = sql.exec('SELECT eid,pdu FROM room_events WHERE room=? ORDER BY seq', room).toArray();
-    const graph = new RoomGraph(room, keys, rows);
+    const graph = new RoomGraph(room, keys, rows, undefined, undefined, version);
     if (rows.length) home.ctx.storage.transactionSync(() => {
       for (const id of graph.tips) sql.exec('INSERT OR IGNORE INTO room_tips VALUES(?,?)', room, id);
     });
@@ -40,7 +50,7 @@ function load(home, server, room) {
   }
   const state = new Map(sql.exec('SELECT kind,skey,eid FROM room_state WHERE room=?', room).toArray()
     .map((r) => [JSON.stringify([r.kind, r.skey]), r.eid]));
-  return new RoomGraph(room, keys, [], {state, tips, events: new StoredEvents(sql, room)});
+  return new RoomGraph(room, keys, [], {state, tips, events: new StoredEvents(sql, room)},undefined,version);
 
 }
 // Until managed-room reconciliations can run atomically, these new live room routes
@@ -65,13 +75,14 @@ async function checkParties(home, server, g) {
     if (['join', 'invite'].includes(e.content.membership)) await openParty(home, server, e.state_key);
 }
 export function save(home, g, pdus) {
+  if (g.version === 11) home.sql.exec('INSERT OR IGNORE INTO room_versions VALUES(?,?)',g.room,g.version);
   let firstInserted;
   let lastInserted;
   for (const p of pdus) {
     const row = home.sql.exec(
       'INSERT OR IGNORE INTO room_events(room,eid,pdu) VALUES(?,?,?) RETURNING seq',
       g.room,
-      eventId(p),
+      eventId(p,g.version),
       JSON.stringify(p)
     ).toArray()[0];
     if (row) {
@@ -145,24 +156,43 @@ function commit(home, server, g, events, extra) {
           state_key,
           content
         }));
-      const id = eventId(event);
+      const id = eventId(event,g.version);
       home.sql.exec(
         'INSERT INTO outbound VALUES(?,?,?,?,?)',
         id,
         server,
         domain(event.state_key),
         '/_matrix/federation/v2/invite/' + encodeURIComponent(g.room) + '/' + encodeURIComponent(id),
-        JSON.stringify({ room_version: '10', event, invite_room_state: state })
+        JSON.stringify({ room_version: String(g.version), event, invite_room_state: state })
       );
     }
     extra?.();
   });
   for (const set of home.waiters.values()) for (const wake of set) wake();
 }
+export function queueProfileUpdates(home, server, user, profile) {
+  home.sql.exec(`INSERT OR IGNORE INTO profile_updates(server,user,room)
+    SELECT ?,?,s.room FROM room_state s JOIN room_known_events e ON e.eid=s.eid
+    WHERE kind='m.room.member' AND skey=? AND json_extract(pdu,'$.content.membership')='join'
+    AND (json_extract(pdu,'$.content.displayname') IS NOT ? OR json_extract(pdu,'$.content.avatar_url') IS NOT ?)`,
+    server,user,user,profile.displayname ?? null,profile.avatar_url ?? null);
+}
+export async function publishProfile(home,server,user,room) {
+  const g = load(home,server,room);
+  const old = g.get('m.room.member',user)?.content;
+  if (old?.membership !== 'join') return;
+  await checkParties(home,server,g);
+  const profile = await home.profile(user,server);
+  if (!profile || (old.displayname === profile.displayname && old.avatar_url === profile.avatar_url)) return;
+  const {displayname,avatar_url,...member} = old;
+  const pdu = await g.local(home.identity,user,'m.room.member',{...member,...profile},user);
+  commit(home,server,g,[pdu]);
+}
+
 export async function create(home, server, user, data) {
   await openParty(home, server, user);
-  if (data.room_version && data.room_version !== '10')
-    fail(400, 'M_UNSUPPORTED_ROOM_VERSION', 'This homeserver implements room version 10');
+  if (data.room_version !== undefined && !['10','11'].includes(data.room_version))
+    fail(400, 'M_UNSUPPORTED_ROOM_VERSION', 'This homeserver implements room versions 10 and 11');
   if (data.room_alias_name || data.invite_3pid?.length || data.creation_content?.predecessor)
     invalid('Aliases, third-party invitations and room upgrades are unavailable');
   const invites = data.invite ?? [],
@@ -172,13 +202,14 @@ export async function create(home, server, user, data) {
   for (const target of invites) await openParty(home, server, target);
   const room = '!' + crypto.randomUUID() + ':' + server,
     g = load(home, server, room);
+  g.version = Number(data.room_version ?? 10);
   const add = (t, c, k = '') => g.local(home.identity, user, t, c, k);
   await add('m.room.create', {
     ...data.creation_content,
-    creator: user,
-    room_version: '10'
+    ...(g.version === 10 ? {creator:user} : {}),
+    room_version: String(g.version)
   });
-  await add('m.room.member', { membership: 'join' }, user);
+  await add('m.room.member', { membership: 'join', ...await home.profile?.(user,server) }, user);
   await add('m.room.power_levels', {
     users: { [user]: 100 },
     state_default: 50,
@@ -234,11 +265,22 @@ function pagePosition(room, value, fallback) {
   return Number(seq);
 }
 
-function messagePage(home, room, joinId, params) {
+// A profile update is another membership event with membership=join. It must not
+// move the history boundary. A leave followed by a rejoin establishes a new one.
+function joinFloor(home, room, user) {
+  return home.sql.exec(`SELECT MIN(seq) AS floor FROM room_events WHERE room=?1
+    AND json_extract(pdu,'$.type')='m.room.member' AND json_extract(pdu,'$.state_key')=?2
+    AND json_extract(pdu,'$.content.membership')='join' AND seq>COALESCE((
+      SELECT MAX(seq) FROM room_events WHERE room=?1 AND json_extract(pdu,'$.type')='m.room.member'
+      AND json_extract(pdu,'$.state_key')=?2 AND json_extract(pdu,'$.content.membership')!='join'),0)`,room,user).one().floor;
+}
+
+function messagePage(home, room, user, params) {
   const dir = params.get('dir');
   if (!['b', 'f'].includes(dir)) invalid('Expected a history direction');
   const backwards = dir === 'b';
-  const floor = home.sql.exec('SELECT seq FROM room_events WHERE eid=?', joinId).one().seq;
+  const floor = joinFloor(home, room, user);
+  if (floor === null) denied('No local room membership');
   const ceiling = home.sql.exec('SELECT MAX(seq)+1 AS n FROM room_events WHERE room=?', room).one().n;
   const from = pagePosition(room, params.get('from'), backwards ? ceiling : floor);
   const to = pagePosition(room, params.get('to'), backwards ? floor : ceiling);
@@ -318,7 +360,7 @@ export async function roomClient(home, server, auth, method, parts, data, params
   )
     denied('Room membership required');
   if (method === 'GET' && action === 'messages')
-    return messagePage(home, room, eventId(g.get('m.room.member', user)), params);
+    return messagePage(home, room, user, params);
   if (method === 'GET' && action === 'state') {
     if (kind) {
       const e = g.get(kind, key ?? '');
@@ -326,7 +368,7 @@ export async function roomClient(home, server, auth, method, parts, data, params
     }
     return ok([...g.state.values()].map((id) => clientEvent(g.events.get(id), id)));
   }
-  if (method === 'GET' && action === 'members') return ok({ chunk: g.members().map((e) => clientEvent(e)) });
+  if (method === 'GET' && action === 'members') return ok({ chunk: g.members().map((e) => clientEvent(e,eventId(e,g.version))) });
   let type,
     content = data,
     stateKey,
@@ -335,7 +377,7 @@ export async function roomClient(home, server, auth, method, parts, data, params
     stateKey = action === 'invite' ? data.user_id : user;
     await openParty(home, server, stateKey);
     type = 'm.room.member';
-    content = { membership: action };
+    content = { membership: action, ...(action === 'join' && await home.profile?.(user,server)) };
   } else if (method === 'PUT' && action === 'send' && kind && key) {
     type = kind;
     tx = JSON.stringify([user, auth.device_id, room, kind, key]);
@@ -352,7 +394,7 @@ export async function roomClient(home, server, auth, method, parts, data, params
   } else missing();
   if (!isObject(content)) invalid('Expected event content');
   const event = await g.local(home.identity, user, type, content, stateKey),
-    id = eventId(event);
+    id = eventId(event,g.version);
   commit(home, server, g, [event], () => {
     if (tx) home.sql.exec('INSERT INTO room_tx VALUES(?,?)', tx, id);
   });
@@ -368,8 +410,8 @@ export async function fedRoom(home, server, peer, method, parts, params, body) {
   if (g.get('m.room.create')?.content['m.federate'] === false) denied('Federation disabled');
   if (action === 'make_join' && method === 'GET') {
     if (domain(value) !== peer) denied('Origin must own user');
-    if (!params.getAll('ver').includes('10'))
-      fail(400, 'M_INCOMPATIBLE_ROOM_VERSION', 'Room version 10 required');
+    if (!params.getAll('ver').includes(String(g.version)))
+      fail(400, 'M_INCOMPATIBLE_ROOM_VERSION', 'Peer does not support this room version');
     const membership = g.get('m.room.member', value)?.content.membership;
     if (
       membership === 'ban' ||
@@ -377,7 +419,7 @@ export async function fedRoom(home, server, peer, method, parts, params, body) {
     )
       denied('An invitation is required');
     return ok({
-      room_version: '10',
+      room_version: String(g.version),
       event: g.template(value, 'm.room.member', { membership: 'join' }, value)
     });
   }
@@ -389,7 +431,7 @@ export async function fedRoom(home, server, peer, method, parts, params, body) {
       body.state_key !== body.sender ||
       domain(body.sender) !== peer ||
       body.content?.membership !== 'join' ||
-      eventId(body) !== value
+      eventId(body,g.version) !== value
     )
       invalid('Invalid join event');
     const prior = home.sql.exec('SELECT response FROM received WHERE id=?', cache).toArray()[0];
@@ -430,7 +472,7 @@ export async function receiveEvent(home, server, peer, pdu) {
   if (domain(pdu.sender) !== peer) denied('Unsupported relayed origin');
   const g = load(home, server, pdu.room_id);
   if (!g.tips.size || !g.members('join').some((e) => domain(e.state_key) === server)) missing();
-  if (g.events.has(eventId(pdu))) return;
+  if (g.events.has(eventId(pdu,g.version))) return;
   await checkParties(home, server, g);
   if (g.get('m.room.member', pdu.sender)?.content.membership !== 'join')
     denied('Sender is not currently joined');
@@ -456,15 +498,18 @@ function stateBeforeStream(home, server, room, firstSeq) {
   // Older rooms lack checkpoints. A sync may also start inside an imported multi-event batch.
   const prior = home.sql.exec('SELECT eid,pdu FROM room_events WHERE room=? AND seq<? ORDER BY seq', room, firstSeq).toArray();
   const keys = { ...graphKeys(home), [server]: verificationKeys(home.identity) };
-  const prefix = new RoomGraph(room, keys, prior);
-  return [...prefix.state.values()].map((id) => clientEvent(prefix.events.get(id), id));
+  const store = new StoredEvents(home.sql, room);
+  const base = store.joinBase();
+  if (base && !prior.length) return base.stateIds.map((id) => clientEvent(store.get(id),id));
+  const prefix = new RoomGraph(room, keys, prior, undefined, base,roomVersion(home.sql,room));
+  return [...prefix.state.values()].map((id) => clientEvent(prefix.events.get(id) ?? store.get(id), id));
 }
 export async function roomSync(home, server, user, cursor, initial) {
   const high = home.sql.exec('SELECT COALESCE(MAX(seq),0) AS n FROM room_events').one().n;
   const rooms = { join: {}, invite: {}, leave: {} },
     changed = new Set();
   const memberships = home.sql.exec(
-    'SELECT s.room,e.pdu FROM room_state s JOIN room_events e ON e.eid=s.eid WHERE kind=? AND skey=?',
+    'SELECT s.room,e.pdu FROM room_state s JOIN room_known_events e ON e.eid=s.eid WHERE kind=? AND skey=?',
     'm.room.member',
     user
   );
@@ -477,7 +522,7 @@ export async function roomSync(home, server, user, cursor, initial) {
     )
       continue;
     const stateRows = home.sql
-      .exec('SELECT s.eid,e.pdu FROM room_state s JOIN room_events e ON e.eid=s.eid WHERE s.room=?', row.room)
+      .exec('SELECT s.eid,e.pdu FROM room_state s JOIN room_known_events e ON e.eid=s.eid WHERE s.room=?', row.room)
       .toArray();
     const stateEvents = stateRows.map((r) => clientEvent(JSON.parse(r.pdu), r.eid));
     const members = stateEvents.filter((e) => e.type === 'm.room.member');
@@ -510,7 +555,8 @@ export async function roomSync(home, server, user, cursor, initial) {
         }
       };
     } else if (membership === 'join') {
-      const sinceJoin = home.sql.exec('SELECT seq FROM room_events WHERE eid=?', own.event_id).one().seq;
+      const sinceJoin = joinFloor(home, row.room, user);
+      if (sinceJoin === null) continue;
       const joinedNow = initial || sinceJoin > cursor;
       const rows = home.sql
         .exec(

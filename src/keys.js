@@ -28,7 +28,7 @@ export function keyCounts(home, user, device) {
 export function sharedUsers(home, user) {
   const rows = home.sql.exec(
     `SELECT DISTINCT b.skey AS user FROM room_state a JOIN room_state b ON b.room=a.room
-  JOIN room_events ea ON ea.eid=a.eid JOIN room_events eb ON eb.eid=b.eid
+  JOIN room_known_events ea ON ea.eid=a.eid JOIN room_known_events eb ON eb.eid=b.eid
   WHERE a.kind='m.room.member' AND b.kind=a.kind AND a.skey=? AND json_extract(ea.pdu,'$.content.membership')='join' AND json_extract(eb.pdu,'$.content.membership')='join'`,
     user
   );
@@ -80,7 +80,7 @@ function changed(home, server, user, device, keys) {
 export function announceJoinedDevices(home, server, room) {
   const participants = home.sql
     .exec(
-      `SELECT skey FROM room_state s JOIN room_events e ON e.eid=s.eid
+      `SELECT skey FROM room_state s JOIN room_known_events e ON e.eid=s.eid
     WHERE s.room=? AND kind='m.room.member' AND json_extract(e.pdu,'$.content.membership')='join'`,
       room
     )

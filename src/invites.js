@@ -3,19 +3,23 @@ import { verificationKeys } from './identity.js';
 import { graphKeys, peerRecord } from './discovery.js';
 import { limited } from './media.js';
 import { verify_signed_pdu } from '../room-v10/pkg/relay_room_v10.js';
-import { RoomGraph, domain, eventId, signPdu } from './graph.js';
-import { openParty, ok, fail, missing, save, receiveEvent } from './rooms.js';
+import { joinBase, resolveJoin } from './join-state.js';
+import { domain, eventId, signPdu } from './graph.js';
+import { openParty, ok, fail, missing, save, receiveEvent, load } from './rooms.js';
 import { remote } from './federation.js';
 
 export function inviteSchema(sql) {
   sql.exec(
     'CREATE TABLE IF NOT EXISTS remote_invites(seq INTEGER PRIMARY KEY AUTOINCREMENT,user TEXT,room TEXT,peer TEXT,signed TEXT,stripped TEXT,joining TEXT,UNIQUE(user,room))'
   );
+  if (!sql.exec('PRAGMA table_info(remote_invites)').toArray().some((col) => col.name === 'version'))
+    sql.exec('ALTER TABLE remote_invites ADD COLUMN version INTEGER NOT NULL DEFAULT 10');
 }
 export async function receiveInvite(home, server, peer, room, id, body) {
   const p = body.event;
-  if (body.room_version !== '10')
-    fail(400, 'M_INCOMPATIBLE_ROOM_VERSION', 'The spike supports room version 10');
+  const version = Number(body.room_version);
+  if (!['10','11'].includes(body.room_version))
+    fail(400, 'M_INCOMPATIBLE_ROOM_VERSION', 'The spike supports room versions 10 and 11');
   if (
     !p ||
     p.type !== 'm.room.member' ||
@@ -23,19 +27,19 @@ export async function receiveInvite(home, server, peer, room, id, body) {
     domain(p.sender) !== peer ||
     p.room_id !== room ||
     domain(p.state_key) !== server ||
-    eventId(p) !== id
+    eventId(p,version) !== id
   )
     fail(400, 'M_INVALID_PARAM', 'Invalid invite event');
   await openParty(home, server, p.state_key);
-  verify_signed_pdu(JSON.stringify(p), JSON.stringify(graphKeys(home)));
-  const signed = await signPdu(home.identity, server, p);
+  verify_signed_pdu(JSON.stringify(p), JSON.stringify(graphKeys(home)),version);
+  const signed = await signPdu(home.identity, server, p,version);
   if (home.sql.exec('SELECT 1 FROM room_events WHERE room=? LIMIT 1', room).toArray().length)
     await receiveEvent(home, server, peer, signed);
   else {
     const prior = home.sql
-      .exec('SELECT signed FROM remote_invites WHERE user=? AND room=?', p.state_key, room)
+      .exec('SELECT signed,version FROM remote_invites WHERE user=? AND room=?', p.state_key, room)
       .toArray()[0];
-    if (prior && eventId(JSON.parse(prior.signed)) === id) return ok({ event: JSON.parse(prior.signed) });
+    if (prior && eventId(JSON.parse(prior.signed),prior.version) === id) return ok({ event: JSON.parse(prior.signed) });
     const preview = (body.invite_room_state ?? [])
       .filter(
         (e) =>
@@ -57,12 +61,12 @@ export async function receiveInvite(home, server, peer, room, id, body) {
       content: p.content
     });
     home.sql.exec(
-      'INSERT OR REPLACE INTO remote_invites(user,room,peer,signed,stripped) VALUES(?,?,?,?,?)',
+      'INSERT OR REPLACE INTO remote_invites(user,room,peer,signed,stripped,version) VALUES(?,?,?,?,?,?)',
       p.state_key,
       room,
       peer,
       JSON.stringify(signed),
-      JSON.stringify(preview)
+      JSON.stringify(preview),version
     );
   }
   return ok({ event: signed });
@@ -82,6 +86,7 @@ export function remoteInvites(home, user, cursor, initial) {
 }
 export async function joinRemote(home, server, user, room, invite) {
   await openParty(home, server, user);
+  const version = invite.version ?? 10;
   const peer = invite.peer,
     prefix = '/_matrix/federation/',
     rid = encodeURIComponent(room);
@@ -89,11 +94,11 @@ export async function joinRemote(home, server, user, room, invite) {
     const response = await remote(home, server, peer, method, prefix + path, content);
     return JSON.parse(new TextDecoder().decode(await limited(response.body, 4 * 1024 * 1024)));
   };
-  // Save the exact signed join before the first remote write; retries use the same v10 event ID.
+  // Save the exact signed join before the first remote write; retries use the same signed event ID.
   let join = invite.joining && JSON.parse(invite.joining);
   if (!join) {
-    const template = await request('GET', 'v1/make_join/' + rid + '/' + encodeURIComponent(user) + '?ver=10');
-    if (template.room_version !== '10') fail(400, 'M_INCOMPATIBLE_ROOM_VERSION', 'Room version 10 required');
+    const template = await request('GET', 'v1/make_join/' + rid + '/' + encodeURIComponent(user) + '?ver=10&ver=11');
+    if (template.room_version !== String(version)) fail(400, 'M_INCOMPATIBLE_ROOM_VERSION', 'Room version differs from the signed invitation');
     const p = template.event;
     if (
       p.room_id !== room ||
@@ -108,14 +113,14 @@ export async function joinRemote(home, server, user, room, invite) {
       sender: user,
       state_key: user,
       type: p.type,
-      content: { membership: 'join' },
+      content: { membership: 'join', ...await home.profile?.(user,server) },
       origin: server,
       origin_server_ts: Date.now(),
       depth: p.depth,
       prev_events: p.prev_events,
       auth_events: p.auth_events
     };
-    join = await signPdu(home.identity, server, proposal);
+    join = await signPdu(home.identity, server, proposal,version);
     home.sql.exec(
       'UPDATE remote_invites SET joining=COALESCE(joining,?) WHERE user=? AND room=? AND signed=?',
       JSON.stringify(join),
@@ -136,7 +141,7 @@ export async function joinRemote(home, server, user, room, invite) {
   }
   const response = await request(
     'PUT',
-    'v2/send_join/' + rid + '/' + encodeURIComponent(eventId(join)),
+    'v2/send_join/' + rid + '/' + encodeURIComponent(eventId(join,version)),
     join
   );
   if (
@@ -146,81 +151,38 @@ export async function joinRemote(home, server, user, room, invite) {
     (response.origin !== undefined && response.origin !== peer)
   )
     fail(502, 'M_BAD_JSON', 'Full room state required');
-  const pool = new Map(),
-    ordered = [],
-    done = new Set(),
-    visiting = new Set();
-  for (const p of [...response.auth_chain, ...response.state, join]) pool.set(eventId(p), p);
-  if (pool.size > 512) fail(503, 'M_RESOURCE_LIMIT_EXCEEDED', 'Peer room exceeds spike limit');
-  let fetched = 0;
-  async function visit(id, child) {
-    if (done.has(id)) return;
-    if (visiting.has(id)) fail(502, 'M_BAD_JSON', 'Cyclic remote history');
-    visiting.add(id);
-    let p = pool.get(id);
-    if (!p) {
-      if (++fetched > 32 || pool.size >= 512)
-        fail(503, 'M_RESOURCE_LIMIT_EXCEEDED', 'Peer room exceeds backfill limit');
-      if (child?.prev_events.includes(id)) {
-        // Matrix peers may hide old history. Only feed reachable, signed ancestors into room replay.
-        const limit = Math.min(64, 512 - pool.size);
-        const batch = await request('POST', 'v1/get_missing_events/' + rid, {
-          earliest_events: [...done].slice(-10), latest_events: [eventId(child)], limit
-        }).catch(() => null);
-        if (Array.isArray(batch?.events) && batch.events.length <= limit)
-          for (const event of batch.events)
-            if (event.room_id === room && !pool.has(eventId(event))) pool.set(eventId(event), event);
-        p = pool.get(id);
-      }
-      if (!p) {
-        if (pool.size >= 512) fail(503, 'M_RESOURCE_LIMIT_EXCEEDED', 'Peer room exceeds backfill limit');
-        const transaction = await request('GET', 'v1/event/' + encodeURIComponent(id));
-        p = transaction.pdus?.find((e) => eventId(e) === id);
-      }
-      if (!p) fail(502, 'M_BAD_JSON', 'Peer did not return the requested predecessor');
-      pool.set(id, p);
-    }
-    if (p.room_id !== room || p.type === 'm.room.server_acl')
-      fail(403, 'M_FORBIDDEN', 'Unsupported federated state');
-    for (const prev of [...p.prev_events, ...p.auth_events]) await visit(prev, p);
-    visiting.delete(id);
-    done.add(id);
-    const { unsigned, ...signed } = p;
-    ordered.push(signed);
-  }
-  await visit(eventId(join));
-  // Reconstruct the room from signed history. Unsigned invite previews are never promoted to state.
-  const origins = new Set(ordered.map((p) => domain(p.sender)));
-  origins.delete(server);
-  if (origins.size > 32) fail(503, 'M_RESOURCE_LIMIT_EXCEEDED', 'Peer room has too many signing origins');
-  for (const origin of origins) await peerRecord(home, origin);
-  const keys = {
-    ...graphKeys(home),
-    [server]: verificationKeys(home.identity)
-  };
-  const imported = ordered.map((p) => ({
-    eid: eventId(p),
-    pdu: JSON.stringify(p)
-  }));
-  const graph = new RoomGraph(room, keys, imported);
-  if (
-    graph.get('m.room.create')?.content['m.federate'] === false ||
-    graph.get('m.room.member', user)?.content.membership !== 'join'
-  )
-    fail(403, 'M_FORBIDDEN', 'Remote room did not admit the local user');
-  for (const m of graph.members())
-    if (['join', 'invite'].includes(m.content.membership)) await openParty(home, server, m.state_key);
+  const base = joinBase(room, response.state, response.auth_chain, join,version);
+  const origins = new Set(base.auth.map((p) => domain(p.sender)));
+  for (const origin of origins) if (origin !== server) await peerRecord(home, origin);
+  const keys = { ...graphKeys(home), [server]: verificationKeys(home.identity) };
+  const state = new Map(resolveJoin(room, keys, base, [],version).map(([type,key,id]) => [JSON.stringify([type,key]),id]));
+  const members = response.state.filter((p) => p.type === 'm.room.member');
+  if (!members.some((m) => domain(m.state_key) === peer && m.content.membership === 'join'))
+    fail(403, 'M_FORBIDDEN', 'The assisting server is not resident in this room');
+  if (!members.some((m) => m.state_key === user && eventId(m,version) === eventId(JSON.parse(invite.signed),version)))
+    fail(403, 'M_FORBIDDEN', 'The room state does not include the accepted invitation');
+  for (const m of members)
+    if (['join','invite'].includes(m.content.membership)) await openParty(home,server,m.state_key);
+
   home.ctx.storage.transactionSync(() => {
-    const current = home.sql
-      .exec('SELECT eid,pdu FROM room_events WHERE room=? ORDER BY seq', room)
-      .toArray();
-    const ids = new Set(current.map((r) => r.eid));
-    const combined = current.length
-      ? new RoomGraph(room, keys, current.concat(imported.filter((r) => !ids.has(r.eid))))
-      : graph;
-    if (combined.get('m.room.member', user)?.content.membership !== 'join')
-      fail(403, 'M_FORBIDDEN', 'Membership changed during join');
-    save(home, combined, ordered);
+    const pending = home.sql.exec('SELECT signed FROM remote_invites WHERE user=? AND room=?',user,room).toArray()[0];
+    const current = load(home,server,room);
+    if (current.get('m.room.member',user)?.content.membership === 'join') return;
+    if (pending?.signed !== invite.signed) fail(409,'M_UNKNOWN','Invitation changed during join');
+    if (current.tips.size) {
+      if (current.version !== version) fail(400,'M_INCOMPATIBLE_ROOM_VERSION','Room version changed');
+      current.checkCurrent(join);
+      current.add(join);
+      save(home,current,[join]);
+    } else {
+      // Outliers supply signatures, authorization and state. Only the join and its
+      // descendants belong to the local timeline and drive pagination or sync.
+      for (const [position,event] of base.auth.entries())
+        home.sql.exec('INSERT INTO room_outliers VALUES(?,?,?,?)',room,eventId(event,version),position,JSON.stringify(event));
+      const id = eventId(join,version);
+      home.sql.exec('INSERT INTO room_bases VALUES(?,?,?)',room,id,JSON.stringify(base.stateIds));
+      save(home,{room,state,version,tips:new Set([id])},[join]);
+    }
     home.sql.exec(
       'DELETE FROM remote_invites WHERE user=? AND room=? AND signed=?',
       user,

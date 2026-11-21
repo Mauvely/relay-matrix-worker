@@ -5,6 +5,7 @@ import {
   fedRoom,
   openParty,
   receiveEvent,
+  roomVersion,
   ok,
   fail,
   missing,
@@ -45,7 +46,7 @@ export async function clientApi(home, server, auth, method, parts, params, body)
   if (parts[0] === 'joined_rooms' && method === 'GET') {
     const rows = home.sql
       .exec(
-        "SELECT s.room FROM room_state s JOIN room_events e ON e.eid=s.eid WHERE kind='m.room.member' AND skey=? AND json_extract(e.pdu,'$.content.membership')='join'",
+        "SELECT s.room FROM room_state s JOIN room_known_events e ON e.eid=s.eid WHERE kind='m.room.member' AND skey=? AND json_extract(e.pdu,'$.content.membership')='join'",
         user
       )
       .toArray();
@@ -54,7 +55,7 @@ export async function clientApi(home, server, auth, method, parts, params, body)
   if (parts[0] === 'capabilities' && method === 'GET')
     return ok({
       capabilities: {
-        'm.room_versions': { default: '10', available: { 10: 'stable' } },
+        'm.room_versions': { default: '10', available: { 10: 'stable', 11: 'stable' } },
         'm.change_password': { enabled: false }
       }
     });
@@ -180,7 +181,7 @@ export async function federationApi(home, server, peer, method, parts, params, b
     for (const p of body.pdus) {
       let id;
       try {
-        id = eventId(p);
+        id = eventId(p,roomVersion(home.sql,p.room_id));
         await receiveEvent(home, server, peer, p);
         pdus[id] = {};
       } catch (e) {

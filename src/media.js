@@ -68,7 +68,7 @@ export async function limited(stream, limit) {
 export async function mediaRoute(request, env, server, home, path, json) {
   const fed = /^\/_matrix\/federation\/v1\/media\/download\/([^/]+)$/.exec(path);
   const client =
-    /^\/_matrix\/(?:media\/(?:v3|r0)|client\/v1\/media)\/(config|upload|download)(?:\/([^/]+)\/([^/]+)(?:\/[^/]*)?)?$/.exec(
+    /^\/_matrix\/(?:media\/(?:v3|r0)|client\/v1\/media)\/(config|upload|download|thumbnail)(?:\/([^/]+)\/([^/]+)(?:\/[^/]*)?)?$/.exec(
       path
     );
   if (!fed && !client) return;
@@ -105,7 +105,7 @@ export async function mediaRoute(request, env, server, home, path, json) {
         (await home.mediaWrite(buffer, request.headers.get('Content-Type') ?? 'application/octet-stream'))
     });
   }
-  if (client[1] === 'download' && request.method === 'GET' && client[3]) {
+  if (['download','thumbnail'].includes(client[1]) && request.method === 'GET' && client[3]) {
     const peer = decodeURIComponent(client[2]),
       id = decodeURIComponent(client[3]);
     let m;
@@ -126,8 +126,10 @@ export async function mediaRoute(request, env, server, home, path, json) {
       }
     }
     if (!m) return json({ errcode: 'M_NOT_FOUND', error: 'Unknown media' }, 404);
+    const image = ['image/png','image/jpeg','image/webp','image/gif','image/avif'].includes(m.type);
+    if (client[1] === 'thumbnail' && !image) return json({errcode:'M_NOT_FOUND',error:'No thumbnail'},404);
     return new Response(m.body, {
-      headers: { ...rawHeaders, 'Content-Type': 'application/octet-stream' }
+      headers: { ...rawHeaders, 'Content-Type': image ? m.type : 'application/octet-stream' }
     });
   }
   return json({ errcode: 'M_UNRECOGNIZED', error: 'Unknown media method' }, 405);
@@ -140,5 +142,5 @@ export async function getRemote(home, server, peer, id) {
     'GET',
     '/_matrix/federation/v1/media/download/' + encodeURIComponent(id)
   );
-  return unpackMedia(await limited(r.body, mediaLimit + 32768), r.headers.get('Content-Type') ?? '');
+  return unpackMedia(await limited(r.body, Math.max(mediaLimit,2*1024*1024) + 32768), r.headers.get('Content-Type') ?? '');
 }

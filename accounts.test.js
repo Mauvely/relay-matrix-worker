@@ -85,3 +85,17 @@ test('SSO codes expire, can be redeemed once and cannot cross homeservers', asyn
   assert.equal(ssoRedirect('https://relay.example/matrix?state=1', ['https://relay.example/matrix']).search, '?state=1');
   db.close();
 });
+
+test('managed profile revisions preserve ownership and remove obsolete avatar mappings', async () => {
+  const db = store();
+  const avatar = '12345678-0000-0000-0000-123456789abc';
+  const set = (revision, name, avatarKey) =>
+    ensureManagedAccount(db, 'example.org','usr_1','alex',null,{revision,name,avatarKey});
+  await set(1,'Alex','avatars/usr_1/'+avatar);
+  assert.deepEqual(db.get('account/alex').profile,{displayname:'Alex',avatar_url:'mxc://example.org/avatar-'+avatar});
+  await set(3,'Ali',null);
+  await set(2,'Stale','avatars/usr_1/'+avatar);
+  assert.deepEqual(db.get('account/alex').profile,{displayname:'Ali'});
+  assert.equal(db.get('avatar-source/'+avatar),undefined);
+  await assert.rejects(set(4,'Alex','avatars/usr_2/'+avatar));
+});

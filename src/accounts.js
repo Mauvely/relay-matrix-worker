@@ -129,7 +129,7 @@ export async function session(storage, authorization, logout = false) {
 }
 
 // Called exclusively through the accounts service binding. No reusable password is created.
-export async function ensureManagedAccount(storage, server, accountId, localpart, organisationId) {
+export async function ensureManagedAccount(storage, server, accountId, localpart, organisationId, profile) {
   if (typeof accountId !== 'string' || !accountId.startsWith('usr_') || accountId.length > 128 ||
       typeof localpart !== 'string' || !alphabet.test(localpart) ||
       !(organisationId === null || (typeof organisationId === 'string' && organisationId.length > 0)))
@@ -142,7 +142,21 @@ export async function ensureManagedAccount(storage, server, accountId, localpart
     const existing = await txn.get(ownerKey);
     if ((prior && prior.accountId !== accountId) || (existing && existing !== userId))
       throw Error('Matrix identity already claimed');
-    await txn.put(key, { ...prior, userId, accountId, organisationId });
+    const account = {...prior,userId,accountId,organisationId};
+    if (profile && (!prior?.profileRevision || profile.revision >= prior.profileRevision)) {
+      if (!Number.isSafeInteger(profile.revision) || profile.revision < 1 || typeof profile.name !== 'string' ||
+          profile.name.length > 120) throw Error('Invalid account profile');
+      const prefix = 'avatars/' + accountId + '/';
+      const id = typeof profile.avatarKey === 'string' && profile.avatarKey.startsWith(prefix)
+        ? profile.avatarKey.slice(prefix.length) : null;
+      if (profile.avatarKey !== null && (!id || !/^[a-f0-9-]{36}$/.test(id))) throw Error('Invalid account avatar');
+      if (prior?.avatarId && id !== prior.avatarId) await txn.delete('avatar-source/'+prior.avatarId);
+      if (id) await txn.put('avatar-source/'+id,profile.avatarKey);
+      account.profileRevision = profile.revision;
+      account.avatarId = id;
+      account.profile = {displayname:profile.name || localpart,...(id ? {avatar_url:'mxc://'+server+'/avatar-'+id} : {})};
+    }
+    await txn.put(key, account);
     await txn.put(ownerKey, userId);
     return userId;
   });

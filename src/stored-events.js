@@ -11,11 +11,17 @@ export class StoredEvents {
     if (!id) return undefined;
     if (this.pending.has(id)) return this.pending.get(id);
     if (this.cached.has(id)) return this.cached.get(id);
-    const row = this.sql.exec('SELECT pdu FROM room_events WHERE room=? AND eid=?', this.room, id).toArray()[0];
+    const row = this.sql.exec('SELECT pdu FROM room_known_events WHERE room=? AND eid=?', this.room, id).toArray()[0];
     if (!row) return undefined;
     const pdu = JSON.parse(row.pdu);
     this.cached.set(id, pdu);
     return pdu;
+  }
+  joinBase() {
+    const row = this.sql.exec('SELECT join_id,state_ids FROM room_bases WHERE room=?',this.room).toArray()[0];
+    if (!row) return null;
+    const auth = this.sql.exec('SELECT pdu FROM room_outliers WHERE room=? ORDER BY position',this.room).toArray().map((r) => JSON.parse(r.pdu));
+    return {join:this.get(row.join_id),stateIds:JSON.parse(row.state_ids),auth};
   }
   has(id) { return this.get(id) !== undefined; }
   set(id, pdu) { this.pending.set(id, pdu); }

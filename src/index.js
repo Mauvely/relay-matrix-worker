@@ -7,7 +7,7 @@ import { backupSchema } from './backup.js';
 import { announceJoinedDevices, keySchema, keyCounts, sharedUsers } from './keys.js';
 import { clientApi, federationApi } from './api.js';
 import { getRemote, limited, mediaSchema, mediaRoute } from './media.js';
-import { openParty, queue, schema, roomSync } from './rooms.js';
+import { openParty, queue, schema, roomSync, queueProfileUpdates, publishProfile } from './rooms.js';
 import { authenticatedOrigin, remote, authenticateQuery } from './federation.js';
 import { delegated, ensureManagedAccount, issueLoginCode, redeemLoginCode, ssoRedirect, login, provision, session } from './accounts.js';
 import { replayProbe, verifyFixtureHistory } from './probe.js';
@@ -25,14 +25,14 @@ export class AccountDirectory extends WorkerEntrypoint {
     return target.href;
   }
 
-  async ensure(server, accountId, localpart, organisationId) {
+  async ensure(server, accountId, localpart, organisationId, profile) {
     const endpoint = this.env.ACCOUNT_ENDPOINT;
     // The first-party apex is itself a Worker. Its binding serves the same discovery documents
     // without a same-zone public subrequest hitting the zone's bot challenge.
     const read = this.env.ACCOUNT_DISCOVERY ? (url, init) => this.env.ACCOUNT_DISCOVERY.fetch(url, init) : fetch;
     if (!endpoint || this.env.DOMAINS?.[endpoint] !== server || !(await delegated(server, endpoint, read)))
       throw Error('Account homeserver is not active');
-    return this.env.HOMESERVERS.getByName(server).ensureAccount(server, accountId, localpart, organisationId);
+    return this.env.HOMESERVERS.getByName(server).ensureAccount(server, accountId, localpart, organisationId, profile);
   }
 }
 
@@ -87,7 +87,7 @@ export class Homeserver extends DurableObject {
       joining &&
       this.sql
         .exec(
-          'SELECT peer,signed,joining FROM remote_invites WHERE user=? AND room=?',
+          'SELECT peer,signed,joining,version FROM remote_invites WHERE user=? AND room=?',
           auth.user_id,
           parts[1]
         )
@@ -130,7 +130,15 @@ export class Homeserver extends DurableObject {
       return false;
     }
   }
-  mediaRead(id) {
+  async mediaRead(id) {
+    if (id.startsWith('avatar-') && this.env.ACCOUNT_DISCOVERY) {
+      const key = await this.ctx.storage.get('avatar-source/'+id.slice(7));
+      if (!key) return null;
+      const response = await this.env.ACCOUNT_DISCOVERY.fetch('https://' + this.env.DOMAINS[this.env.ACCOUNT_ENDPOINT] + '/api/account/avatar/'+key);
+      const type = response.headers.get('content-type');
+      if (!response.ok || !['image/png','image/jpeg','image/webp'].includes(type)) return null;
+      return {body:await limited(response.body,2*1024*1024),type};
+    }
     return this.sql.exec('SELECT body,type FROM media WHERE id=?', id).toArray()[0] ?? null;
   }
   mediaWrite(buffer, type) {
@@ -142,6 +150,16 @@ export class Homeserver extends DurableObject {
     return getRemote(this, server, peer, id);
   }
   async alarm() {
+    for (const {server,user,room} of this.sql.exec('SELECT * FROM profile_updates WHERE due<=? LIMIT 8', Date.now()).toArray()) {
+      try {
+        await this.ctx.blockConcurrencyWhile(async () => {
+          await publishProfile(this,server,user,room);
+          this.sql.exec('DELETE FROM profile_updates WHERE user=? AND room=?',user,room);
+        });
+      } catch {
+        this.sql.exec('UPDATE profile_updates SET due=? WHERE user=? AND room=?',Date.now()+60000,user,room);
+      }
+    }
     const sql = this.sql;
     const ready = sql
       .exec(
@@ -155,7 +173,7 @@ export class Homeserver extends DurableObject {
           people = new Set();
         for (const event of content.pdus ?? (content.event ? [content.event] : [])) {
           const members = sql.exec(
-            "SELECT s.skey FROM room_state s JOIN room_events e ON e.eid=s.eid WHERE s.room=? AND kind='m.room.member' AND json_extract(e.pdu,'$.content.membership') IN ('join','invite')",
+            "SELECT s.skey FROM room_state s JOIN room_known_events e ON e.eid=s.eid WHERE s.room=? AND kind='m.room.member' AND json_extract(e.pdu,'$.content.membership') IN ('join','invite')",
             event.room_id
           );
           for (const m of members) people.add(m.skey);
@@ -181,7 +199,9 @@ export class Homeserver extends DurableObject {
         'SELECT MIN(COALESCE(r.due,0)) AS due FROM outbound o LEFT JOIN retry r ON o.id=r.id WHERE NOT EXISTS (SELECT 1 FROM outbound earlier WHERE earlier.peer=o.peer AND earlier.rowid<o.rowid)'
       )
       .one().due;
-    if (next !== null) await this.ctx.storage.setAlarm(Math.max(Date.now() + 10, next));
+    const profiles = sql.exec('SELECT MIN(due) AS due FROM profile_updates').one().due;
+    const due = [next, profiles].filter((value) => value !== null);
+    if (due.length) await this.ctx.storage.setAlarm(Math.max(Date.now()+10,Math.min(...due)));
   }
   async roomUpdates(server, user, cursor, initial) {
     return roomSync(this, server, user, cursor, initial);
@@ -212,8 +232,15 @@ export class Homeserver extends DurableObject {
     };
   }
 
-  ensureAccount(server, accountId, localpart, organisationId) {
-    return ensureManagedAccount(this.ctx.storage, server, accountId, localpart, organisationId);
+  async ensureAccount(server, accountId, localpart, organisationId, profile) {
+    const id = await ensureManagedAccount(this.ctx.storage, server, accountId, localpart, organisationId, profile);
+    if (profile) await this.profileChanged(server,id);
+    return id;
+  }
+  async profileChanged(server,user) {
+    queueProfileUpdates(this,server,user,await this.profile(user,server));
+    if (this.sql.exec('SELECT 1 FROM profile_updates LIMIT 1').toArray().length)
+      await this.ctx.storage.setAlarm(Date.now()+10);
   }
 
   async provision(server, localpart, organisationId) {
@@ -383,7 +410,7 @@ export class Homeserver extends DurableObject {
     const local = /^@([^:]+):(.+)$/.exec(userId);
     if (!local || local[2] !== server) return null;
     const account = await this.ctx.storage.get('account/' + local[1]);
-    return account?.userId === userId ? { displayname: local[1] } : null;
+    return account?.userId === userId ? account.profile ?? { displayname: local[1] } : null;
   }
 
   async keys(serverName) {
@@ -467,7 +494,8 @@ export default {
       const params = new URL(request.url).searchParams;
       const profile = await homeserver.profile(params.get('user_id'), server);
       if (!profile) return json({ errcode: 'M_NOT_FOUND', error: 'Unknown user' }, 404);
-      return json(!params.has('field') || params.get('field') === 'displayname' ? profile : {});
+      const field = params.get('field');
+      return json(!field ? profile : Object.hasOwn(profile,field) ? {[field]:profile[field]} : {});
     }
     const client = /^\/_matrix\/client\/(?:v3|r0)\/(login|account\/whoami|logout)$/.exec(pathname)?.[1];
     const managed = env.ACCOUNT_ENDPOINT === hostname;

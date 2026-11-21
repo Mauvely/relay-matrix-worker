@@ -6,10 +6,10 @@ import { readFileSync } from 'node:fs';
 import { initSync, prepare_event } from './room-v10/pkg/relay_room_v10.js';
 import { createIdentity } from './src/identity.js';
 import { sign } from './src/federation.js';
-import { schema, create, fedRoom, roomClient, roomSync } from './src/rooms.js';
-import { eventId } from './src/graph.js';
+import { schema, create, fedRoom, load, roomClient, roomSync } from './src/rooms.js';
+import { eventId, signPdu } from './src/graph.js';
 initSync({ module: readFileSync(new URL('./room-v10/pkg/relay_room_v10_bg.wasm', import.meta.url)) });
-test('private v10 room requires an invitation and accepts a signed remote join exactly once', async () => {
+for (const version of [10,11]) test(`private v${version} room checks invitations, signed state and join retries`, async () => {
   const db = new DatabaseSync(':memory:');
   const sql = {
     exec(query, ...args) {
@@ -42,21 +42,41 @@ test('private v10 room requires an invitation and accepts a signed remote join e
   const {
     body: { room_id: room }
   } = await create(home, server, user, {
+    room_version: String(version),
     initial_state: [{ type: 'm.room.encryption', content: { algorithm: 'm.megolm.v1.aes-sha2' } }]
   });
   const make = () =>
-    fedRoom(home, server, peer, 'GET', ['make_join', room, other], new URLSearchParams('ver=10'));
+    fedRoom(home, server, peer, 'GET', ['make_join', room, other], new URLSearchParams({ver:String(version)}));
   await assert.rejects(make, /invitation/);
   await roomClient(home, server, { user_id: user }, 'POST', [room, 'invite'], { user_id: other });
   const {
     body: { event: p }
   } = await make();
-  const [hash, redacted] = JSON.parse(prepare_event(JSON.stringify(p)));
+  const [hash, redacted] = JSON.parse(prepare_event(JSON.stringify(p),version));
   p.hashes = { sha256: hash };
   p.signatures = { [peer]: { 'ed25519:1': await sign(remote, redacted) } };
   const join = () =>
-    fedRoom(home, server, peer, 'PUT', ['send_join', room, eventId(p)], new URLSearchParams(), p);
-  assert.deepEqual(await join(), await join());
+    fedRoom(home, server, peer, 'PUT', ['send_join', room, eventId(p,version)], new URLSearchParams(), p);
+  const first = await join();
+  assert.deepEqual(first, await join());
+  const {joinBase,resolveJoin} = await import('./src/join-state.js');
+  const {state,auth_chain} = first.body;
+  const base = joinBase(room,state,auth_chain,p,version);
+  const keys = {[peer]:{'ed25519:1':remote.publicKey},[server]:{'ed25519:1':identity.publicKey}};
+  assert.ok(resolveJoin(room,keys,base,[],version).some(([type,key,id]) =>
+    type === 'm.room.member' && key === other && id === eventId(p,version)));
+  assert.throws(() => resolveJoin(room,keys,{...base,stateIds:[...base.stateIds,base.stateIds[0]]},[],version),/duplicate/i);
+  assert.throws(() => resolveJoin(room,keys,{...base,join:{...p,signatures:{}}},[],version));
+  assert.throws(() => resolveJoin(room,keys,base,[],version===10 ? 11 : 10));
+  await assert.rejects(fedRoom(home,server,peer,'GET',['make_join',room,other],new URLSearchParams('ver=9')),/support/i);
+  // Each signed topic references the join anchor, so they form a genuine fork.
+  const graph = load(home,server,room);
+  const forks = await Promise.all(['First','Second'].map((topic) =>
+    signPdu(identity,server,graph.template(user,'m.room.topic',{topic},''),version)));
+  const resolved = resolveJoin(room,keys,base,forks,version);
+  assert.deepEqual(resolved,resolveJoin(room,keys,base,forks.toReversed(),version));
+  assert.ok(resolved.some(([type,key,id]) =>
+    type === 'm.room.topic' && forks.some((pdu) => eventId(pdu,version) === id)));
   const initial = await roomSync(home, server, user, 0, true);
   const timeline = initial.rooms.join[room].timeline;
   assert.ok(timeline.events.some((e) => e.sender === other));
@@ -82,7 +102,7 @@ test('private v10 room requires an invitation and accepts a signed remote join e
   );
   assert.deepEqual(
     (await messages(other, { dir: 'f' })).chunk.map((e) => e.event_id),
-    [eventId(p)]
+    [eventId(p,version)]
   );
   await assert.rejects(messages(user, { dir: 'b', from: '!another:server/9' }), /history token/);
   await assert.rejects(messages('@stranger:' + server, { dir: 'b' }), /membership/i);

@@ -8,10 +8,11 @@ import {
   replay
 } from '../room-v10/pkg/relay_room_v10.js';
 import { signingKeyId } from './identity.js';
+import { resolveJoin } from './join-state.js';
 import { sign } from './federation.js';
 
 export const domain = (user) => /^@[^:]+:(.+)$/.exec(user)?.[1];
-export const eventId = (pdu) => reference_id(JSON.stringify(pdu));
+export const eventId = (pdu, version = 10) => reference_id(JSON.stringify(pdu), version);
 export function clientEvent(pdu, id = eventId(pdu)) {
   const { sender, type, content, origin_server_ts, room_id, state_key } = pdu;
   return {
@@ -24,8 +25,8 @@ export function clientEvent(pdu, id = eventId(pdu)) {
     ...(state_key === undefined ? {} : { state_key })
   };
 }
-export async function signPdu(identity, server, pdu) {
-  const [hash, redacted] = JSON.parse(prepare_event(JSON.stringify(pdu)));
+export async function signPdu(identity, server, pdu, version = 10) {
+  const [hash, redacted] = JSON.parse(prepare_event(JSON.stringify(pdu), version));
   return {
     ...pdu,
     hashes: { sha256: hash },
@@ -33,7 +34,9 @@ export async function signPdu(identity, server, pdu) {
   };
 }
 export class RoomGraph {
-  constructor(room, keys, rows = [], stored) {
+  constructor(room, keys, rows = [], stored, base, version = 10) {
+    this.base = base;
+    this.version = version;
     this.room = room;
     this.keys = keys;
     if (stored) {
@@ -50,8 +53,15 @@ export class RoomGraph {
   }
   resolve() {
     this.unchangedState = false;
-    const state = JSON.parse(replay(JSON.stringify([...this.events.values()]), JSON.stringify(this.keys)));
+    const state = this.resolved([...this.events.values()]);
     this.state = new Map(state.map(([type, key, id]) => [JSON.stringify([type, key]), id]));
+  }
+  resolved(events) {
+    const base = this.base ?? this.events.joinBase?.();
+    if (!base) return JSON.parse(replay(JSON.stringify(events), JSON.stringify(this.keys), this.version));
+    const anchor = eventId(base.join,this.version);
+    if (!events.some((p) => eventId(p,this.version) === anchor)) throw Error('Missing history before the join anchor');
+    return resolveJoin(this.room,this.keys,base,events.filter((p) => eventId(p,this.version) !== anchor),this.version);
   }
   get(type, key = '') {
     return this.events.get(this.state.get(JSON.stringify([type, key])));
@@ -62,7 +72,7 @@ export class RoomGraph {
       .filter((e) => e.type === 'm.room.member' && (!membership || e.content.membership === membership));
   }
   template(sender, type, content, stateKey) {
-    const fields = JSON.parse(auth_fields(type, sender, stateKey, JSON.stringify(content)));
+    const fields = JSON.parse(auth_fields(type, sender, stateKey, JSON.stringify(content),this.version));
     return {
       type,
       room_id: this.room,
@@ -77,13 +87,15 @@ export class RoomGraph {
     };
   }
   async local(identity, sender, type, content, stateKey) {
-    const pdu = await signPdu(identity, domain(sender), this.template(sender, type, content, stateKey));
+    const pdu = await signPdu(identity, domain(sender), this.template(sender, type, content, stateKey),this.version);
     this.add(pdu);
     return pdu;
   }
   before(parents) {
     if (parents.length === this.tips.size && [...this.tips].every((id) => parents.includes(id)))
       return [...this.state.values()].map((id) => this.events.get(id));
+    const base = this.base ?? this.events.joinBase?.();
+    const anchor = base && eventId(base.join,this.version);
     const ancestors = new Set(),
       pending = [...parents];
     while (pending.length) {
@@ -92,21 +104,21 @@ export class RoomGraph {
         const p = this.events.get(id);
         if (!p) throw Error('Missing predecessor');
         ancestors.add(id);
-        pending.push(...p.prev_events);
+        if (id !== anchor) pending.push(...p.prev_events);
       }
     }
     const events = [...this.events.entries()].filter(([id]) => ancestors.has(id)).map(([, p]) => p);
-    return JSON.parse(replay(JSON.stringify(events), JSON.stringify(this.keys))).map(([, , id]) =>
-      this.events.get(id)
+    return this.resolved(events).map(([, , id]) =>
+      this.events.get(id) ?? this.base?.auth.find((p) => eventId(p,this.version) === id)
     );
   }
   checkCurrent(pdu) {
     const state = [...this.state.values()].map((id) => ({ ...this.events.get(id), event_id: id }));
-    check_current(JSON.stringify({ ...pdu, event_id: eventId(pdu) }), JSON.stringify(state));
+    check_current(JSON.stringify({ ...pdu, event_id: eventId(pdu,this.version) }), JSON.stringify(state),this.version);
   }
   add(pdu) {
     if (pdu.room_id !== this.room) throw Error('Room ID mismatch');
-    const id = eventId(pdu);
+    const id = eventId(pdu,this.version);
     if (this.events.has(id)) return;
     if (this.tips.size === 1 && pdu.prev_events?.length === 1 && this.tips.has(pdu.prev_events[0])) {
       const checked = (id) => {
@@ -115,7 +127,7 @@ export class RoomGraph {
         return { ...event, event_id: id };
       };
       check_linear(JSON.stringify(pdu), JSON.stringify(this.keys), pdu.prev_events[0],
-        JSON.stringify([...this.state.values()].map(checked)), JSON.stringify(pdu.auth_events.map(checked)));
+        JSON.stringify([...this.state.values()].map(checked)), JSON.stringify(pdu.auth_events.map(checked)),this.version);
       this.events.set(id, pdu);
       if (pdu.state_key !== undefined) {
         this.unchangedState = false;

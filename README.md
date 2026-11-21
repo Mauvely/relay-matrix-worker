@@ -18,7 +18,7 @@ For a fixed reference server, set `PEER_KEYS` and `PEER_URLS` to the trusted ver
 
 ## Room replay
 
-Ruma, compiled to WebAssembly, verifies v10 PDUs, checks event authorisation, tracks predecessors and resolves signed state forks. The checked-in synthetic fixture contains a room from Synapse and two concurrent topic events. An authenticated POST to `/_relay/spike/replay` using `PROBE_TOKEN` checks convergence under both arrival orders. The catch-up probe accepts `{start, events}` at `/_relay/spike/catchup`, verifies the entire candidate history and commits an authorised batch atomically. It checks the durable prefix length, room ID, pinned fixture keys, a 1 MiB body limit and a 512-event cap. This endpoint is for the synthetic fixture only.
+Ruma, compiled to WebAssembly, verifies v10 and v11 PDUs, checks event authorisation, tracks predecessors and resolves signed state forks. The checked-in synthetic fixture contains a room from Synapse and two concurrent topic events. An authenticated POST to `/_relay/spike/replay` using `PROBE_TOKEN` checks convergence under both arrival orders. The catch-up probe accepts `{start, events}` at `/_relay/spike/catchup`, verifies the entire candidate history and commits an authorised batch atomically. It checks the durable prefix length, room ID, pinned fixture keys, a 1 MiB body limit and a 512-event cap. This endpoint is for the synthetic fixture only.
 
 ## Interoperability status, 21 November 2026
 
@@ -32,14 +32,16 @@ On 21 November, Element 1.12.35 used the deployed Worker while Relay used a sepa
 
 To repeat the walkthrough:
 
-1. Configure a pinned Synapse peer as described above. Set its default room version to `10` for new conversations it originates. Provision two personal Worker accounts and one Synapse account.
+1. Configure a pinned Synapse peer as described above. Choose room version `10` or `11` for new conversations it originates. Provision two personal Worker accounts and one Synapse account.
 2. Sign in to Element and NeoChat with the Worker accounts. Sign in to Relay's `/matrix` page with the Synapse account. Use each client's recovery setup before verifying.
 3. Invite the other account to an encrypted conversation. Accept in the other client. Compare all seven SAS emoji, confirm on each device, send a distinct message and download a file in each direction. Compare downloaded bytes with the originals.
-4. Start a second encrypted room from Synapse. The Worker signs the invite, requests a join template, submits its signed join and verifies the room history before syncing the conversation.
+4. Start a second encrypted room from Synapse. The Worker signs the invite, requests a join template, submits its signed join and verifies the signed state and authorization chain before syncing the conversation.
 5. Sign in to Relay on the Worker and repeat with NeoChat. Use a fresh browser profile and the saved recovery key to check restoration.
 
 A fresh stock Synapse and the Worker discovered each other and exchanged signed joins and messages in rooms created on either server. In a Synapse room with joined-only history and 48 earlier messages, the Worker verified the redacted graph, exposed only the new member's join in client history, and delivered the next message.
 
-Linear v10 appends validate against committed room state. A deployed Worker accepted 525 messages in one room. Sync returned the latest 50 and the client paged back through the boundary. Importing an independent room still reconstructs its graph in one operation, with at most 512 PDUs and 32 missing-history fetches. The encrypted media limit is 1 MiB. Complement's version-response and private-room-creation assertions passed against both servers using a remote deployment adapter.
+Linear room appends validate against committed room state. A deployed Worker accepted 525 messages in one room. Sync returned the latest 50 and the client paged back through the boundary. Joining an invited remote room verifies its resolved state, transitive signed auth chain, and the joining event. The Worker stores auth events separately from the local timeline. Joined-only history begins at admission. The 4 MiB send-join response limit applies to room state and auth data, independently of the number of earlier messages. The encrypted media limit is 1 MiB. Complement's version-response and private-room-creation assertions passed against both servers using a remote deployment adapter.
 
-SRV-based discovery, peer signing-key rotation, larger remote joins, gap recovery after disconnection, restricted-room admission and broader Complement coverage remain cutover work.
+SRV-based discovery, peer signing-key rotation, large membership and auth snapshots, gap recovery after disconnection, restricted-room admission and broader Complement coverage remain cutover work.
+
+Stock Synapse and the Worker created version 11 rooms in both directions, admitted the invitee, and exchanged messages and replies. Both v10 and v11 joined-history tests passed with 520 prior Synapse messages. The Worker exposed only the new membership, then delivered the next message. Unit tests replay two signed forks from a join anchor in opposite orders and reject incomplete or wrongly signed state.
