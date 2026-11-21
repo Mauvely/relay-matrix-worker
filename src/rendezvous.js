@@ -31,7 +31,7 @@ export async function exchange(sql, method, id, data, tag) {
       sql.exec('UPDATE rendezvous SET data=?,etag=?,modified=? WHERE id=?', data, r.etag, now, key);
     }
   }
-  if (method === 'GET' && tag === r.etag) status = 304;
+  if (method === 'GET' && tag?.replace(/^W\//, '') === r.etag) status = 304;
   return {
     status,
     etag: r.etag,
@@ -69,7 +69,8 @@ export async function rendezvousRoute(req, home) {
     req.headers.get(method === 'GET' ? 'If-None-Match' : 'If-Match')
   );
   const headers = {
-    'Cache-Control': 'no-store',
+    // A strong validator must survive the edge for the next conditional PUT.
+    'Cache-Control': 'no-store, no-transform',
     'Referrer-Policy': 'no-referrer',
     'Access-Control-Allow-Origin': '*',
     'Access-Control-Expose-Headers': 'ETag, Expires, Last-Modified, Location',

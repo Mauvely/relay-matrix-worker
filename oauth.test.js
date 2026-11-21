@@ -111,6 +111,7 @@ test('QR rendezvous is conditional, expires and can be closed by either particip
     id = 'test';
   const first = await exchange(sql, 'POST', id, 'first');
   assert.equal((await exchange(sql, 'GET', id, '', first.etag)).status, 304);
+  assert.equal((await exchange(sql, 'GET', id, '', 'W/' + first.etag)).status, 304);
   assert.equal((await exchange(sql, 'PUT', id, 'different', 'wrong')).status, 412);
   const second = await exchange(sql, 'PUT', id, 'second', first.etag);
   assert.notEqual(first.etag, second.etag);
