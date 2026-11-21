@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
+import { logoutSession, reconcileSessions, sessionSchema } from './device-sessions.js';
 import { deliver, syncDevices } from './device.js';
 import { slidingPath, slidingSchema, slidingSync } from './sliding.js';
 import { approveOAuth, oauthOperation, oauthRoute, oauthSchema, oauthSession } from './oauth.js';
@@ -64,11 +65,14 @@ export class Homeserver extends DurableObject {
     inviteSchema(this.sql);
     slidingSchema(this.sql);
     oauthSchema(this.sql);
+    sessionSchema(this.sql);
     rendezvousSchema(this.sql);
     keySchema(this.sql);
     backupSchema(this.sql);
     mediaSchema(this.sql);
     ctx.blockConcurrencyWhile(async () => {
+      reconcileSessions(this);
+      await this.scheduleOutbound();
       const restoring = Boolean(env.SIGNING_KEY_SERVER) && ctx.id.equals(env.HOMESERVERS.idFromName(env.SIGNING_KEY_SERVER));
       this.identity = await initializeIdentity(ctx.storage, restoring, env.SYNAPSE_SIGNING_KEY);
     });
@@ -173,12 +177,15 @@ export class Homeserver extends DurableObject {
     const result = callsPeer ? await run() : await this.ctx.blockConcurrencyWhile(run);
     if (result.status === 200 && (joining || (peer && parts[0] === 'send_join')))
       this.ctx.storage.transactionSync(() => announceJoinedDevices(this, server, parts[1]));
+    await this.scheduleOutbound();
+    return JSON.parse(JSON.stringify(result));
+  }
+  async scheduleOutbound() {
     if (
       this.sql.exec('SELECT 1 FROM outbound LIMIT 1').toArray().length &&
       (await this.ctx.storage.getAlarm()) === null
     )
       await this.ctx.storage.setAlarm(Date.now() + 20);
-    return JSON.parse(JSON.stringify(result));
   }
   async mediaAccount(server, user) {
     if (!user.endsWith(':' + server)) throw Error('Wrong homeserver for upload');
@@ -289,7 +296,11 @@ export class Homeserver extends DurableObject {
     return approveOAuth(this,server,accountId,target);
   }
   async oauth(server,op,input) {
-    try { return await oauthOperation(this,server,op,input); }
+    try {
+      const result = await oauthOperation(this,server,op,input);
+      if (op === 'revoke' || op === 'token') await this.scheduleOutbound();
+      return result;
+    }
     catch(e) { return {status:e.status ?? 400,body:{error:e.oauth ?? 'invalid_request'}}; }
   }
   async sliding(server,auth,body,query) {
@@ -349,17 +360,19 @@ export class Homeserver extends DurableObject {
   }
 
   async login(server, data) {
-    const result = data?.type === 'm.login.token'
+    return data?.type === 'm.login.token'
       ? await redeemLoginCode(this.ctx.storage, this.sql, server, data)
       : await login(this.ctx.storage, server, data);
-    if (result.status === 200)
-      this.sql.exec('INSERT OR IGNORE INTO devices VALUES (?,?)', result.body.user_id, result.body.device_id);
-    return result;
   }
 
   async session(authorization, logout) {
-    const legacy = await session(this.ctx.storage, authorization, logout);
-    return legacy.status === 200 ? legacy : (await oauthSession(this,authorization,logout)) ?? legacy;
+    if (logout) {
+      const result = await logoutSession(this, authorization);
+      if (result.status === 200) await this.scheduleOutbound();
+      return result;
+    }
+    const legacy = await session(this.ctx.storage, authorization);
+    return legacy.status === 200 ? legacy : (await oauthSession(this,authorization)) ?? legacy;
   }
 
   async party(userId, server) {

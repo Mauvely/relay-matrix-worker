@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 import { secret, digest } from './accounts.js';
+import { revokeOAuthSession, expireOAuthSessions } from './device-sessions.js';
 import { limited } from './media.js';
 
 const prefix = '/_matrix/oauth/';
@@ -184,15 +185,10 @@ export async function oauthOperation(home, server, op, input) {
     if (!r) error('invalid_request');
     return toAccounts(server, approval(origin, JSON.parse(r.params), r.id, uc));
   }
-  if (op === 'token') sql.exec('DELETE FROM oauth_sessions WHERE renew<=?', now);
+  if (op === 'token') expireOAuthSessions(home, now);
   if (op === 'revoke') {
     const hash = await digest(input.token ?? '');
-    sql.exec(
-      'DELETE FROM oauth_sessions WHERE (access=? OR refresh=?) AND client=?',
-      hash,
-      hash,
-      input.client_id ?? ''
-    );
+    revokeOAuthSession(home, hash, input.client_id ?? '');
     return reply({});
   }
   const c = client(sql, input.client_id);
@@ -312,7 +308,7 @@ export async function oauthOperation(home, server, op, input) {
     });
   });
 }
-export async function oauthSession(home, authorization, logout) {
+export async function oauthSession(home, authorization) {
   const token = /^Bearer ([a-f0-9]{64})$/i.exec(authorization ?? '')?.[1];
   if (!token) return null;
   const hash = await digest(token);
@@ -325,8 +321,7 @@ export async function oauthSession(home, authorization, logout) {
     )
     .toArray()[0];
   if (!r) return null;
-  if (logout) home.sql.exec('DELETE FROM oauth_sessions WHERE access=?', hash);
-  return reply(logout ? {} : { user_id: r.user, device_id: r.device });
+  return reply({ user_id: r.user, device_id: r.device });
 }
 export async function oauthRoute(request, home, server) {
   const url = new URL(request.url);

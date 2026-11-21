@@ -79,10 +79,13 @@ async function startSession(storage, account, body) {
   if (typeof deviceId !== 'string' || !deviceId || deviceId.length > 255)
     return matrixError(400, 'M_INVALID_PARAM', 'Invalid device ID');
   const token = secret();
-  await storage.put('session/' + (await digest(token)), {
-    user_id: account.userId,
-    device_id: deviceId,
-    organisationId: account.organisationId
+  const hash = await digest(token);
+  storage.transactionSync(() => {
+    storage.sql.exec('INSERT OR IGNORE INTO devices VALUES(?,?)', account.userId, deviceId);
+    storage.sql.exec('INSERT INTO legacy_device_tokens VALUES(?,?,?)', hash, account.userId, deviceId);
+    storage.kv.put('session/' + hash, {
+      user_id: account.userId, device_id: deviceId, organisationId: account.organisationId
+    });
   });
   return { status: 200, body: { user_id: account.userId, device_id: deviceId, access_token: token } };
 }
@@ -118,14 +121,13 @@ export async function redeemLoginCode(storage, sql, server, body) {
   return startSession(storage, account, body);
 }
 
-export async function session(storage, authorization, logout = false) {
+export async function session(storage, authorization) {
   const token = /^Bearer ([0-9a-f]{64})$/i.exec(authorization ?? '')?.[1];
   if (!token) return matrixError(401, 'M_MISSING_TOKEN', 'A bearer token is required');
   const key = 'session/' + (await digest(token));
   const value = await storage.get(key);
   if (!value) return matrixError(401, 'M_UNKNOWN_TOKEN', 'Unknown access token');
-  if (logout) await storage.delete(key);
-  return { status: 200, body: logout ? {} : { user_id: value.user_id, device_id: value.device_id } };
+  return { status: 200, body: { user_id: value.user_id, device_id: value.device_id } };
 }
 
 // Called exclusively through the accounts service binding. No reusable password is created.

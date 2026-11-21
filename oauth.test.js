@@ -1,43 +1,17 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { DatabaseSync } from 'node:sqlite';
+import { sessionHome } from './fixtures/session-home.js';
 import { createHash } from 'node:crypto';
-import { approveOAuth, oauthOperation, oauthSchema, oauthSession } from './src/oauth.js';
+import { approveOAuth, oauthOperation, oauthSession } from './src/oauth.js';
 import { exchange, rendezvousSchema } from './src/rendezvous.js';
 
 function setup() {
-  const db = new DatabaseSync(':memory:');
-  const sql = {
-    exec(query, ...args) {
-      if (query.includes(';')) return db.exec(query);
-      const rows = db.prepare(query).all(...args);
-      return { one: () => rows[0], toArray: () => rows };
-    }
-  };
-  sql.exec('CREATE TABLE devices(user TEXT,device TEXT,PRIMARY KEY(user,device));');
-  oauthSchema(sql);
-  rendezvousSchema(sql);
-  return {
-    sql,
-    env: { ACCOUNT_ENDPOINT: 'matrix.example.com', SSO_CLIENTS: ['https://relay.example.com/'] },
-    ctx: {
-      storage: {
-        get: (k) => (k === 'mauvely-id/account' ? '@a:example.com' : undefined),
-        transactionSync(fn) {
-          db.exec('BEGIN');
-          try {
-            const result = fn();
-            db.exec('COMMIT');
-            return result;
-          } catch (e) {
-            db.exec('ROLLBACK');
-            throw e;
-          }
-        }
-      }
-    }
-  };
+  const h = sessionHome();
+  h.env = { ACCOUNT_ENDPOINT: 'matrix.example.com', SSO_CLIENTS: ['https://relay.example.com/'] };
+  h.ctx.storage.kv.put('mauvely-id/account', '@a:example.com');
+  rendezvousSchema(h.sql);
+  return h;
 }
 
 test('mobile OAuth binds the code to the registered redirect, PKCE, account and fresh device', async () => {
@@ -74,15 +48,18 @@ test('mobile OAuth binds the code to the registered redirect, PKCE, account and 
   const tokens = (await op('token', exchange)).body;
   await assert.rejects(op('token', exchange));
   assert.equal(
-    (await oauthSession(h, 'Bearer ' + tokens.access_token, false)).body.user_id,
+    (await oauthSession(h, 'Bearer ' + tokens.access_token)).body.user_id,
     '@a:example.com'
   );
   const rotated = (
     await op('token', { client_id: id, grant_type: 'refresh_token', refresh_token: tokens.refresh_token })
   ).body;
-  assert.equal(await oauthSession(h, 'Bearer ' + tokens.access_token, false), null);
+  assert.equal(await oauthSession(h, 'Bearer ' + tokens.access_token), null);
+  await op('revoke', { client_id: 'different client', token: rotated.refresh_token });
+  assert.equal(h.sql.exec('SELECT COUNT(*) AS n FROM devices').one().n, 1);
   await op('revoke', { client_id: id, token: rotated.refresh_token });
-  assert.equal(await oauthSession(h, 'Bearer ' + rotated.access_token, false), null);
+  assert.equal(await oauthSession(h, 'Bearer ' + rotated.access_token), null);
+  assert.equal(h.sql.exec('SELECT COUNT(*) AS n FROM devices').one().n, 0);
 });
 test('device flow waits for explicit account approval and consumes a grant once', async () => {
   const h = setup(),

@@ -50,8 +50,11 @@ export async function clientApi(home, server, auth, method, parts, params, body)
       fail(503,'M_UNAVAILABLE','Call relay temporarily unavailable');
     }
   }
-  if (parts[0] === 'keys' && method === 'POST')
+  if (parts[0] === 'keys' && method === 'POST') {
+    if (parts[1] === 'upload' && !home.sql.exec('SELECT 1 FROM devices WHERE user=? AND device=?', user, auth.device_id).toArray().length)
+      fail(401, 'M_UNKNOWN_TOKEN', 'Device signed out');
     return clientKeys(home, server, auth, parts.slice(1).join('/'), body);
+  }
   if (parts[0] === 'devices' && method === 'GET') {
     const rows = home.sql.exec('SELECT device AS device_id FROM devices WHERE user=?', user).toArray();
     return ok(parts[1] ? (rows.find((r) => r.device_id === parts[1]) ?? missing()) : { devices: rows });

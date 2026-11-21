@@ -54,13 +54,19 @@ function signedDevice(home, user, device) {
   }
   return { device_id: row.device, keys };
 }
+export function deviceRemoved(home, server, user, device) {
+  publishChange(home, server, user, {device_id: device, deleted: true}, true);
+}
 function changed(home, server, user, device, keys) {
+  const entry = signedDevice(home, user, device) ?? signedDevice(home, user, null);
+  publishChange(home, server, user, entry, Boolean(keys));
+}
+function publishChange(home, server, user, entry, incremental) {
   const last = home.sql.exec('SELECT MAX(seq) AS n FROM key_changes WHERE user=?', user).one().n;
   home.sql.exec('INSERT INTO key_changes(user) VALUES(?)', user);
   const stream = home.sql.exec('SELECT last_insert_rowid() AS n').one().n;
   // Omitting keys in a delta can replace an encrypted device with a keyless
   // entry on Synapse. Identity/signature changes require a full device-list fetch.
-  const entry = signedDevice(home, user, device) ?? signedDevice(home, user, null);
   if (!entry) return;
   for (const peer of new Set([...sharedUsers(home, user)].map(domain)))
     if (peer !== server)
@@ -72,7 +78,7 @@ function changed(home, server, user, device, keys) {
         [
           {
             edu_type: 'm.device_list_update',
-            content: { user_id: user, ...entry, stream_id: stream, prev_id: keys && last ? [last] : [] }
+            content: { user_id: user, ...entry, stream_id: stream, prev_id: incremental && last ? [last] : [] }
           }
         ]
       );
