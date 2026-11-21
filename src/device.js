@@ -84,6 +84,23 @@ function object(value) {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
 
+export async function permittedDeviceEvents(env, user, rows) {
+  const events = [];
+  if (!rows.length) return events;
+  const recipient = await lookup(env, user),
+    parties = new Map();
+  for (const row of rows) {
+    if (!parties.has(row.sender)) parties.set(row.sender, await lookup(env, row.sender));
+    if (canShare(parties.get(row.sender), recipient, env.ORGANISATIONS ?? {}))
+      events.push({
+        sender: row.sender,
+        type: row.kind,
+        content: JSON.parse(row.content)
+      });
+  }
+  return events;
+}
+
 export async function syncDevices(request, env, server) {
   const home = env.HOMESERVERS.getByName(server);
   const auth = await home.session(request.headers.get('Authorization'), false);
@@ -127,19 +144,9 @@ export async function syncDevices(request, env, server) {
   } catch {
     return matrixError(503, 'M_UNAVAILABLE', 'Room state or organisation policy unavailable');
   }
-  const events = [];
+  let events;
   try {
-    const recipient = await lookup(env, user),
-      parties = new Map();
-    for (const row of rows) {
-      if (!parties.has(row.sender)) parties.set(row.sender, await lookup(env, row.sender));
-      if (canShare(parties.get(row.sender), recipient, env.ORGANISATIONS ?? {}))
-        events.push({
-          sender: row.sender,
-          type: row.kind,
-          content: JSON.parse(row.content)
-        });
-    }
+    events = await permittedDeviceEvents(env, user, rows);
   } catch {
     return matrixError(503, 'M_UNAVAILABLE', 'Could not establish delivery policy');
   }

@@ -278,7 +278,7 @@ export async function create(home, server, user, data) {
   commit(home, server, g, [...g.events.values()]);
   return ok({ room_id: room });
 }
-function pageToken(room, seq) {
+export function pageToken(room, seq) {
   return room + '/' + seq;
 }
 
@@ -292,7 +292,7 @@ function pagePosition(room, value, fallback) {
 
 // A profile update is another membership event with membership=join. It must not
 // move the history boundary. A leave followed by a rejoin establishes a new one.
-function joinFloor(home, room, user) {
+export function joinFloor(home, room, user) {
   return home.sql.exec(`SELECT MIN(seq) AS floor FROM room_client_events WHERE room=?1
     AND json_extract(pdu,'$.type')='m.room.member' AND json_extract(pdu,'$.state_key')=?2
     AND json_extract(pdu,'$.content.membership')='join' AND seq>COALESCE((

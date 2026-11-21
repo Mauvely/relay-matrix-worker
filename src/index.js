@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 import { deliver, syncDevices } from './device.js';
+import { slidingPath, slidingSchema, slidingSync } from './sliding.js';
+import { approveOAuth, oauthOperation, oauthRoute, oauthSchema, oauthSession } from './oauth.js';
+import { exchange, rendezvousSchema, rendezvousRoute } from './rendezvous.js';
 import module from '../room-v10/pkg/relay_room_v10_bg.wasm';
 import { initSync } from '../room-v10/pkg/relay_room_v10.js';
 import { inviteSchema, joinRemote, joinServers, lookupAlias, remoteInvites } from './invites.js';
@@ -20,6 +23,8 @@ import { initializeIdentity, signServerKeys } from './identity.js';
 export class AccountDirectory extends WorkerEntrypoint {
   async grant(server, accountId, redirect) {
     const endpoint = this.env.ACCOUNT_ENDPOINT;
+    if (endpoint && this.env.DOMAINS?.[endpoint] === server && typeof redirect === 'string' && redirect.startsWith('https://'+endpoint+'/_matrix/oauth/approve?'))
+      return this.env.HOMESERVERS.getByName(server).approveOAuth(server,accountId,redirect);
     const target = ssoRedirect(redirect, this.env.SSO_CLIENTS);
     if (!endpoint || this.env.DOMAINS?.[endpoint] !== server || !target) throw Error('Matrix sign-in unavailable');
     target.searchParams.set('loginToken', await this.env.HOMESERVERS.getByName(server).loginCode(accountId));
@@ -57,6 +62,9 @@ export class Homeserver extends DurableObject {
     this.sql.exec('CREATE TABLE IF NOT EXISTS sso_codes(hash TEXT PRIMARY KEY,user TEXT NOT NULL,expires INTEGER NOT NULL)');
     schema(this.sql);
     inviteSchema(this.sql);
+    slidingSchema(this.sql);
+    oauthSchema(this.sql);
+    rendezvousSchema(this.sql);
     keySchema(this.sql);
     backupSchema(this.sql);
     mediaSchema(this.sql);
@@ -276,6 +284,22 @@ export class Homeserver extends DurableObject {
     const due = [next, profiles].filter((value) => value !== null);
     if (due.length) await this.ctx.storage.setAlarm(Math.max(Date.now()+10,Math.min(...due)));
   }
+  rendezvous(method,id,data,tag) { return exchange(this.sql,method,id,data,tag); }
+  approveOAuth(server,accountId,target) {
+    return approveOAuth(this,server,accountId,target);
+  }
+  async oauth(server,op,input) {
+    try { return await oauthOperation(this,server,op,input); }
+    catch(e) { return {status:e.status ?? 400,body:{error:e.oauth ?? 'invalid_request'}}; }
+  }
+  async sliding(server,auth,body,query) {
+    try {
+      return {status:200,body:JSON.parse(JSON.stringify(await slidingSync(this,server,auth,body,query)))};
+    } catch (e) {
+      return {status:e.status ?? 503,body:{errcode:e.errcode ?? 'M_UNAVAILABLE',error:e.status ? e.message : 'Sync unavailable'}};
+    }
+  }
+
   async roomUpdates(server, user, cursor, initial) {
     return roomSync(this, server, user, cursor, initial);
   }
@@ -334,7 +358,8 @@ export class Homeserver extends DurableObject {
   }
 
   async session(authorization, logout) {
-    return session(this.ctx.storage, authorization, logout);
+    const legacy = await session(this.ctx.storage, authorization, logout);
+    return legacy.status === 200 ? legacy : (await oauthSession(this,authorization,logout)) ?? legacy;
   }
 
   async party(userId, server) {
@@ -496,7 +521,7 @@ function json(body, status = 200) {
     status,
     headers: {
       'Access-Control-Allow-Origin': '*',
-      'Access-Control-Allow-Headers': 'Authorization, Content-Type',
+      'Access-Control-Allow-Headers': 'Authorization, Content-Type, If-Match, If-None-Match',
       'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
       'Cache-Control': 'no-store'
     }
@@ -530,11 +555,28 @@ export default {
       const result = await homeserver.catchup(data);
       return json(result.body, result.status);
     }
+    if (env.ACCOUNT_ENDPOINT === hostname) {
+      const authResponse = await oauthRoute(request,homeserver,server);
+      if (authResponse) return authResponse;
+      const channel = await rendezvousRoute(request,homeserver);
+      if (channel) return channel;
+    }
     if (
       pathname === '/_matrix/client/v1/auth_metadata' ||
       pathname.startsWith('/_matrix/client/unstable/org.matrix.msc3814.v1/')
     )
       return json({ errcode: 'M_UNRECOGNIZED', error: 'Unsupported endpoint' }, 404);
+    if (request.method === 'POST' && pathname === slidingPath) {
+      const auth = await homeserver.session(request.headers.get('Authorization'),false);
+      if (auth.status !== 200) return json(auth.body,auth.status);
+      let body;
+      try {
+        body = JSON.parse(new TextDecoder().decode(await limited(request.body,65536)));
+        if (!body || typeof body !== 'object' || Array.isArray(body)) throw Error();
+      } catch { return json({errcode:'M_BAD_JSON',error:'Invalid sliding sync body'},400); }
+      const result = await homeserver.sliding(server,auth.body,body,new URL(request.url).search);
+      return json(result.body,result.status);
+    }
     const media = await mediaRoute(request, env, server, homeserver, pathname, json);
     if (media) return media;
     const devicePath = /^\/_matrix\/client\/(?:v3|r0)\/sendToDevice\/([^/]+)\/([^/]+)$/.exec(pathname);
@@ -646,7 +688,7 @@ export default {
       if (pathname === '/_matrix/client/versions')
         return json({
           versions: ['v1.1', 'v1.11'],
-          unstable_features: { 'com.mauvely.interop_spike': true }
+          unstable_features: { 'com.mauvely.interop_spike': true, 'org.matrix.simplified_msc3575': true, ...(env.ACCOUNT_ENDPOINT === hostname ? {'org.matrix.msc4108':true} : {}) }
         });
     }
     const path = /^\/_matrix\/(client|federation)\/(?:v[123]|r0|unstable)\/(.+)$/.exec(pathname);

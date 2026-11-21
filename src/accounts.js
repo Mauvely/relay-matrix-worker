@@ -2,12 +2,12 @@
 const encoder = new TextEncoder();
 const alphabet = /^[a-z0-9._=-]{1,128}$/;
 
-function secret() {
+export function secret() {
   const bytes = crypto.getRandomValues(new Uint8Array(32));
   return Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
 }
 
-async function digest(value) {
+export async function digest(value) {
   return Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', encoder.encode(value))), (b) =>
     b.toString(16).padStart(2, '0')
   ).join('');

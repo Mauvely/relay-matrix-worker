@@ -340,3 +340,29 @@ test('public room joins use via hints, legacy hints and the room ID domain in or
   assert.deepEqual(joinServers('!id:local.test',new URLSearchParams(),'local.test'), []);
   assert.deepEqual(joinServers('#alias:creator.test',hints,'local.test'), []);
 });
+
+test('Element X gets a window, authorised room state and incremental timeline tied to its device', async () => {
+  const {slidingSchema,slidingSync} = await import('./src/sliding.js');
+  const {inviteSchema} = await import('./src/invites.js');
+  const sql = memorySql(), server = 'worker.test', user='@a:'+server;
+  const home = {sql,identity:await createIdentity(),ctx:{storage:{transactionSync:fn=>fn()}},env:{DOMAINS:{}},
+    waiters:new Map(),party:async()=>({organisationId:null})};
+  schema(sql); inviteSchema(sql); slidingSchema(sql);
+  const auth = {user_id:user,device_id:'phone'};
+  const room = (await create(home,server,user,{name:'Example'})).body.room_id;
+  const req = {lists:{all_rooms:{ranges:[[0,19]],timeline_limit:1,required_state:[['m.room.name','']]}},conn_id:'rooms'};
+  const first = await slidingSync(home,server,auth,req,'');
+  assert.equal(first.lists.all_rooms.count,1);
+  assert.equal(first.rooms[room].name,'Example');
+  assert.equal(first.rooms[room].timeline.length,1);
+  assert.equal(first.rooms[room].required_state[0].content.name,'Example');
+  const query = 'pos='+first.pos;
+  await assert.rejects(slidingSync(home,server,{...auth,device_id:'other'},req,query),{errcode:'M_UNKNOWN_POS'});
+  assert.deepEqual(Object.keys((await slidingSync(home,server,auth,req,query)).rooms),[]);
+  await roomClient(home,server,auth,'PUT',[room,'send','m.room.message','one'],{msgtype:'m.text',body:'Hello'});
+  const second = await slidingSync(home,server,auth,req,query);
+  assert.equal(second.rooms[room].timeline[0].content.body,'Hello');
+  assert.equal(second.rooms[room].num_live,1);
+  const stranger=await slidingSync(home,server,{...auth,user_id:'@outside:'+server},{room_subscriptions:{[room]:{timeline_limit:20}}},'');
+  assert.deepEqual(Object.keys(stranger.rooms),[]);
+});
