@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 import { verificationKeys } from './identity.js';
-import { graphKeys, peerRecord } from './discovery.js';
+import { graphKeys, keysForEvent } from './discovery.js';
 import { limited } from './media.js';
 import { verify_signed_pdu } from '../room-v10/pkg/relay_room_v10.js';
 import { joinBase, resolveJoin } from './join-state.js';
@@ -36,6 +36,7 @@ export async function receiveInvite(home, server, peer, room, id, body) {
     if (existing.version !== version) fail(400,'M_INCOMPATIBLE_ROOM_VERSION','Room version differs from local state');
   }
   await openParty(home, server, p.state_key);
+  await keysForEvent(home, peer, p);
   verify_signed_pdu(JSON.stringify(p), JSON.stringify(graphKeys(home)),version);
   const signed = await signPdu(home.identity, server, p,version);
   if (home.sql.exec('SELECT 1 FROM room_events WHERE room=? LIMIT 1', room).toArray().length)
@@ -157,8 +158,10 @@ export async function joinRemote(home, server, user, room, invite) {
   )
     fail(502, 'M_BAD_JSON', 'Full room state required');
   const base = joinBase(room, response.state, response.auth_chain, join,version);
-  const origins = new Set(base.auth.map((p) => domain(p.sender)));
-  for (const origin of origins) if (origin !== server) await peerRecord(home, origin);
+  for (const event of base.auth) {
+    const origin = domain(event.sender);
+    if (origin !== server) await keysForEvent(home, origin, event);
+  }
   const keys = { ...graphKeys(home), [server]: verificationKeys(home.identity) };
   const state = new Map(resolveJoin(room, keys, base, [],version).map(([type,key,id]) => [JSON.stringify([type,key]),id]));
   const acl = response.state.find((p) => p.type === 'm.room.server_acl' && p.state_key === '');

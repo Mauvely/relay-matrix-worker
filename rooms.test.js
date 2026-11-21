@@ -66,6 +66,10 @@ for (const version of [10,11]) test(`private v${version} room checks invitations
   const keys = {[peer]:{'ed25519:1':remote.publicKey},[server]:{'ed25519:1':identity.publicKey}};
   assert.ok(resolveJoin(room,keys,base,[],version).some(([type,key,id]) =>
     type === 'm.room.member' && key === other && id === eventId(p,version)));
+  const dated = until => ({...keys,[peer]:{'ed25519:1':{key:remote.publicKey,until}}});
+  assert.deepEqual(resolveJoin(room,dated(p.origin_server_ts),base,[],version),
+    resolveJoin(room,keys,base,[],version));
+  assert.throws(() => resolveJoin(room,dated(p.origin_server_ts-1),base,[],version));
   assert.throws(() => resolveJoin(room,keys,{...base,stateIds:[...base.stateIds,base.stateIds[0]]},[],version),/duplicate/i);
   assert.throws(() => resolveJoin(room,keys,{...base,join:{...p,signatures:{}}},[],version));
   assert.throws(() => resolveJoin(room,keys,base,[],version===10 ? 11 : 10));

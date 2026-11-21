@@ -13,8 +13,8 @@ import { delegated, ensureManagedAccount, issueLoginCode, redeemLoginCode, ssoRe
 import { replayProbe, verifyFixtureHistory } from './probe.js';
 import { recoverPredecessors } from './gaps.js';
 import { DurableObject, WorkerEntrypoint } from 'cloudflare:workers';
-import { discoverPeer } from './discovery.js';
-import { canonical, initializeIdentity, signServerKeys } from './identity.js';
+import { discoverPeer, mergePeerKeys } from './discovery.js';
+import { initializeIdentity, signServerKeys } from './identity.js';
 
 // Private RPC binding for the account owner. The public fetch handler has no equivalent route.
 export class AccountDirectory extends WorkerEntrypoint {
@@ -48,8 +48,12 @@ export class Homeserver extends DurableObject {
     );
     this.sql.exec('CREATE TABLE IF NOT EXISTS federation_peers(name TEXT PRIMARY KEY, record TEXT NOT NULL)');
     this.discoveredKeys = Object.create(null);
-    for (const row of this.sql.exec('SELECT name,record FROM federation_peers').toArray())
-      this.discoveredKeys[row.name] = JSON.parse(row.record).keys;
+    this.peerRequests = new Map();
+    for (const row of this.sql.exec('SELECT name,record FROM federation_peers').toArray()) {
+      const record = JSON.parse(row.record);
+      this.discoveredKeys[row.name] = record.eventKeys ?? Object.fromEntries(
+        Object.entries(record.keys).map(([id,key]) => [id,{key,until:record.expires}]));
+    }
     this.sql.exec('CREATE TABLE IF NOT EXISTS sso_codes(hash TEXT PRIMARY KEY,user TEXT NOT NULL,expires INTEGER NOT NULL)');
     schema(this.sql);
     inviteSchema(this.sql);
@@ -62,23 +66,38 @@ export class Homeserver extends DurableObject {
     });
   }
 
-  async resolvePeer(name) {
+  async resolvePeer(name, requestedKey) {
     if (Object.hasOwn(this.env.PEER_KEYS ?? {}, name) && Object.hasOwn(this.env.PEER_URLS ?? {}, name))
       return {
         keys: this.env.PEER_KEYS[name],
         endpoint: this.env.PEER_URLS[name]
       };
     if (!this.env.DISCOVER_PEERS) throw Error('Federation discovery is disabled');
+    // A restarting peer often sends device and room transactions simultaneously.
+    // They must all wait for the new key before authenticating their requests.
+    if (this.peerRequests.has(name)) return this.peerRequests.get(name);
     const row = this.sql.exec('SELECT record FROM federation_peers WHERE name=?', name).toArray()[0];
     const cached = row && JSON.parse(row.record);
-    if (cached?.expires > Date.now()) return cached;
-    const fresh = await discoverPeer(name);
-    // Persist only a stable key set until replay has event-time key validity information.
-    const known = this.discoveredKeys[name];
-    if (known && canonical(known) !== canonical(fresh.keys)) throw Error('Peer signing keys changed');
-    this.sql.exec('INSERT OR REPLACE INTO federation_peers VALUES(?,?)', name, JSON.stringify(fresh));
-    this.discoveredKeys[name] = fresh.keys;
-    return fresh;
+    const now = Date.now();
+    const unknown = requestedKey && !Object.hasOwn(cached?.keys ?? {}, requestedKey);
+    if (cached?.expires > now) {
+      if (!unknown || (cached.lastKeyMiss ?? 0) > now - 60_000) return cached;
+      cached.lastKeyMiss = now;
+      this.sql.exec('UPDATE federation_peers SET record=? WHERE name=?', JSON.stringify(cached), name);
+    }
+    const refresh = discoverPeer(name).then((discovered) => {
+      const fresh = mergePeerKeys(cached, discovered);
+      if (cached?.lastKeyMiss) fresh.lastKeyMiss = cached.lastKeyMiss;
+      this.sql.exec('INSERT OR REPLACE INTO federation_peers VALUES(?,?)', name, JSON.stringify(fresh));
+      this.discoveredKeys[name] = fresh.eventKeys;
+      return fresh;
+    });
+    this.peerRequests.set(name, refresh);
+    try {
+      return await refresh;
+    } finally {
+      this.peerRequests.delete(name);
+    }
   }
 
   async api(server, auth, peer, method, parts, query, body) {
@@ -503,7 +522,7 @@ export default {
     }
     if (pathname === '/_matrix/federation/v1/query/profile' && request.method === 'GET') {
       if (
-        !(await authenticateQuery(request, server, async (name) => (await homeserver.resolvePeer(name)).keys))
+        !(await authenticateQuery(request, server, async (name, key) => (await homeserver.resolvePeer(name, key)).keys))
       )
         return json(
           {
@@ -623,7 +642,7 @@ export default {
         ? await authenticatedOrigin(
             request,
             server,
-            async (name) => (await homeserver.resolvePeer(name)).keys,
+            async (name, key) => (await homeserver.resolvePeer(name, key)).keys,
             body
           )
         : null;

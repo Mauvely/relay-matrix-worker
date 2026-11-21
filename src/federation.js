@@ -20,7 +20,7 @@ export async function authenticatedOrigin(request, destination, peers, content) 
   if (!origin || !keyId?.startsWith('ed25519:') || !sig) return false;
   let keys;
   try {
-    keys = typeof peers === 'function' ? await peers(origin) : Object.hasOwn(peers, origin) && peers[origin];
+    keys = typeof peers === 'function' ? await peers(origin,keyId) : Object.hasOwn(peers, origin) && peers[origin];
   } catch {
     return false;
   }

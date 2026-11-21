@@ -3,7 +3,7 @@ import { eventId, domain } from './graph.js';
 import { remote } from './federation.js';
 import { limited } from './media.js';
 import { verify_signed_pdu } from '../room-v10/pkg/relay_room_v10.js';
-import { graphKeys, peerRecord } from './discovery.js';
+import { graphKeys, keysForEvent } from './discovery.js';
 import { verificationKeys } from './identity.js';
 import { load, requireRoomAccess } from './rooms.js';
 
@@ -22,7 +22,7 @@ export async function recoverPredecessors(home, server, peer, pdu, request = rem
   if (!graph.members('join').some((m) => domain(m.state_key) === peer))
     throw Error('Only resident servers can supply missing history');
   const author = domain(pdu.sender);
-  if (author !== server) await peerRecord(home, author);
+  if (author !== server) await keysForEvent(home, author, pdu);
   verify_signed_pdu(
     JSON.stringify(pdu),
     JSON.stringify({ ...graphKeys(home), [server]: verificationKeys(home.identity) }),
@@ -75,8 +75,6 @@ export async function recoverPredecessors(home, server, peer, pdu, request = rem
     }
     for (const id of pdu.prev_events) visit(id, head);
     if (!needs.size) {
-      for (const name of new Set(ordered.map((p) => domain(p.sender))))
-        if (name !== server) await peerRecord(home, name);
       return ordered;
     }
     if (!added) break;

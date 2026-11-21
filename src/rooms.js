@@ -3,7 +3,7 @@ import { saveAudience, missingEvents } from './history.js';
 import { acl_allows } from '../room-v10/pkg/relay_room_v10.js';
 import { verificationKeys } from './identity.js';
 import { StoredEvents } from './stored-events.js';
-import { graphKeys, peerRecord } from './discovery.js';
+import { graphKeys, keysForEvent } from './discovery.js';
 import { clientEvent, domain, eventId, RoomGraph } from './graph.js';
 
 export const ok = (body = {}) => ({ status: 200, body });
@@ -508,7 +508,7 @@ export async function receiveEvent(home, server, peer, pdu, recovered = []) {
       unready('Missing predecessor');
     if (event.type === 'm.room.member') await openParty(home,server,event.state_key);
     const author = domain(event.sender);
-    if (author !== server && !g.keys[author]) g.keys[author] = (await peerRecord(home,author)).keys;
+    if (author !== server) g.keys[author] = await keysForEvent(home, author, event);
     g.checkCurrent(event);
     g.add(event);
     additions.push(event);

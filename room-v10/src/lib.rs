@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! Offline replay of a complete, topologically ordered room trace.
 //! The caller supplies trusted public keys separately from the signed PDUs.
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use ruma_common::{CanonicalJsonObject, MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedRoomId,
     OwnedUserId, RoomId, UserId, room_version_rules::RoomVersionRules};
 use ruma_events::{StateEventType, TimelineEventType};
@@ -45,6 +45,35 @@ fn version_rules(version: Option<u8>) -> Result<&'static RoomVersionRules,String
         11 => Ok(&RoomVersionRules::V11),
         _ => Err("unsupported room version".into()),
     }
+}
+// Operator-pinned keys are unbounded. Discovered keys are valid only for
+// events signed within the lifetime published by their homeserver.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum EventKey {
+    Pinned(ruma_common::serde::Base64),
+    Dated { key: ruma_common::serde::Base64, until: i64 },
+}
+type EventKeys = BTreeMap<String,BTreeMap<String,EventKey>>;
+
+fn keys_at(keys: &EventKeys, event: &CanonicalJsonObject) -> Result<PublicKeyMap,String> {
+    let ts: i64 = event.get("origin_server_ts").and_then(|v| v.as_integer())
+        .ok_or("Missing event timestamp")?.into();
+    let signatures = event.get("signatures").and_then(|v| v.as_object()).ok_or("Missing event signatures")?;
+    let mut public = PublicKeyMap::new();
+    for (server, signatures) in signatures {
+        let Some(known) = keys.get(server) else { continue };
+        let Some(signed) = signatures.as_object() else { continue };
+        for id in signed.keys() {
+            let key = match known.get(id) {
+                Some(EventKey::Pinned(key)) => key,
+                Some(EventKey::Dated {key,until}) if ts <= *until => key,
+                _ => continue,
+            };
+            public.entry(server.clone()).or_default().insert(id.clone(),key.clone());
+        }
+    }
+    Ok(public)
 }
 type State = StateMap<OwnedEventId>;
 
@@ -92,10 +121,10 @@ impl Trace {
                 snapshot.get(&(ty.clone(),key.into())).and_then(|id| self.events.get(id))
             })
     }
-    fn verified(&self, mut obj: CanonicalJsonObject, keys: &PublicKeyMap) -> Result<Pdu,String> {
+    fn verified(&self, mut obj: CanonicalJsonObject, keys: &EventKeys) -> Result<Pdu,String> {
         obj.remove("unsigned");
         ruma_state_res::check_pdu_format(&obj, &self.rules.event_format)?;
-        if ruma_signatures::verify_event(keys, &obj, self.rules).map_err(|e| e.to_string())? != Verified::All {
+        if ruma_signatures::verify_event(&keys_at(keys, &obj)?, &obj, self.rules).map_err(|e| e.to_string())? != Verified::All {
             // A peer may only disclose a redacted predecessor before our join. Accept its
             // signed graph and authorization fields only when it is already the exact
             // room-version redaction. The caller also stores this PDU for later federation.
@@ -108,7 +137,7 @@ impl Trace {
         value["event_id"] = format!("${hash}").into();
         serde_json::from_value(value).map_err(|e| e.to_string())
     }
-    fn apply(&mut self, obj: CanonicalJsonObject, keys: &PublicKeyMap) -> Result<(),String> {
+    fn apply(&mut self, obj: CanonicalJsonObject, keys: &EventKeys) -> Result<(),String> {
         let p = self.verified(obj, keys)?;
         if self.events.values().next().is_some_and(|first| first.room_id != p.room_id) { return Err("mixed room IDs".into()); }
         if self.events.contains_key(&p.event_id) { return Ok(()); }
@@ -149,7 +178,7 @@ fn resolved(trace: &Trace) -> Result<String,String> {
 // have no local timeline position. Only the join establishes a known predecessor state.
 #[wasm_bindgen]
 pub fn replay_join(room: &str, outliers: &str, state_ids: &str, join: &str, following: &str, keys: &str, version: Option<u8>) -> Result<String,String> {
-    let keys: PublicKeyMap = serde_json::from_str(keys).map_err(|e| e.to_string())?;
+    let keys: EventKeys = serde_json::from_str(keys).map_err(|e| e.to_string())?;
     let auth: Vec<CanonicalJsonObject> = serde_json::from_str(outliers).map_err(|e| e.to_string())?;
     let mut trace = Trace::new(version)?;
     let mut root = None;
@@ -233,7 +262,7 @@ pub fn verify_signed_pdu(event: &str, keys: &str, version: Option<u8>) -> Result
     let event = serde_json::from_str(event).map_err(|e| e.to_string())?;
     let keys = serde_json::from_str(keys).map_err(|e| e.to_string())?;
     ruma_state_res::check_pdu_format(&event, &rules.event_format)?;
-    if ruma_signatures::verify_event(&keys,&event,rules).map_err(|e| e.to_string())? != Verified::All {
+    if ruma_signatures::verify_event(&keys_at(&keys, &event)?,&event,rules).map_err(|e| e.to_string())? != Verified::All {
         return Err("PDU content hash mismatch".into());
     }
     Ok(())

@@ -82,7 +82,7 @@ export async function mediaRoute(request, env, server, home, path, json) {
   if (fed) {
     if (
       request.method !== 'GET' ||
-      !(await authenticatedOrigin(request, server, async (name) => (await home.resolvePeer(name)).keys))
+      !(await authenticatedOrigin(request, server, async (name, key) => (await home.resolvePeer(name, key)).keys))
     )
       return json({ errcode: 'M_UNAUTHORIZED', error: 'Signed media request required' }, 401);
     const m = await readLocal(env, home, server, fed[1]);

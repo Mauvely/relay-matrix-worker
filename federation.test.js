@@ -85,3 +85,35 @@ test('HTTPS delegation authenticates a fresh key document for the exact canonica
   ])
     await assert.rejects(discoverPeer(name, read, now));
 });
+
+test('discovery preserves signatures from before rotation and limits current federation credentials', async () => {
+  const { discoverPeer, mergePeerKeys, keysForEvent } = await import('./src/discovery.js');
+  const { createIdentity, signServerKeys } = await import('./src/identity.js');
+  const { sign } = await import('./src/federation.js');
+  const name = 'rotating.example:443', now = Date.now();
+  const first = await createIdentity(), second = { ...await createIdentity(), keyId: 'ed25519:second' };
+  const oldId = 'ed25519:1', newId = second.keyId;
+  const discover = (doc, t) => discoverPeer(name, async () => Response.json(doc), t);
+  const prior = await discover(await signServerKeys(name, first, now), now);
+  const next = await signServerKeys(name, second, now + 1000);
+  const { signatures, ...body } = next;
+  body.old_verify_keys = { [oldId]: { key: first.publicKey, expired_ts: now + 500 } };
+  const doc = { ...body, signatures: { [name]: { [newId]: await sign(second, canonical(body)) } } };
+  const rotated = mergePeerKeys(prior, await discover(doc, now + 1000));
+  assert.deepEqual(Object.keys(rotated.keys), [newId]);
+  assert.deepEqual(rotated.eventKeys[oldId], { key: first.publicKey, until: now + 500 });
+  const omitted = mergePeerKeys(prior, await discover(next, now + 1000));
+  assert.equal(omitted.eventKeys[oldId].until, now + 1000);
+  const later = mergePeerKeys(rotated, await discover(next, now + 1001));
+  assert.equal(later.eventKeys[oldId].until, now + 500);
+  const reused = await discover(await signServerKeys(name, { ...second, keyId: oldId }, now + 2000), now + 2000);
+  assert.throws(() => mergePeerKeys(rotated, reused), /reused/);
+  const requested = [];
+  const home = { env: { DISCOVER_PEERS:true }, discoveredKeys:{[name]:prior.eventKeys},
+    async resolvePeer(author,id) { requested.push([author,id]); return rotated; } };
+  const signedBy = id => ({ signatures:{[name]:{[id]:'signature'}},origin_server_ts:now });
+  await keysForEvent(home,name,signedBy(oldId));
+  assert.deepEqual(requested,[]);
+  assert.equal((await keysForEvent(home,name,signedBy(newId)))[newId].key,second.publicKey);
+  assert.deepEqual(requested,[[name,newId]]);
+});
