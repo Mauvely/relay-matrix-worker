@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
+import { canonical } from './identity.js';
 import { saveAudience, missingEvents } from './history.js';
 import { acl_allows } from '../room-v10/pkg/relay_room_v10.js';
 import { verificationKeys } from './identity.js';
@@ -230,17 +231,15 @@ export async function create(home, server, user, data) {
     redact: 50,
     ...data.power_level_content_override
   });
+  const publicRoom = data.preset === 'public_chat' || (!data.preset && data.visibility === 'public');
   const defaults = new Map([
     [
       'm.room.join_rules',
       {
-        join_rule:
-          data.preset === 'public_chat' || (!data.preset && data.visibility === 'public')
-            ? 'public'
-            : 'invite'
+        join_rule: publicRoom ? 'public' : 'invite'
       }
     ],
-    ['m.room.history_visibility', { history_visibility: 'joined' }]
+    ['m.room.history_visibility', { history_visibility: publicRoom ? 'shared' : 'joined' }]
   ]);
   for (const e of initial) if (e?.state_key === '' || e?.state_key === undefined) defaults.delete(e?.type);
   for (const [type, content] of defaults) await add(type, content);
@@ -411,8 +410,11 @@ export async function roomClient(home, server, auth, method, parts, data, params
     stateKey = key ?? '';
   } else missing();
   if (!isObject(content)) invalid('Expected event content');
+  const previous = action === 'state' && g.get(type, stateKey);
   const event = await g.local(home.identity, user, type, content, stateKey),
     id = eventId(event,g.version);
+  if (previous?.sender === user && canonical(previous.content) === canonical(content))
+    return ok({event_id: eventId(previous, g.version)});
   commit(home, server, g, [event], () => {
     if (tx) home.sql.exec('INSERT INTO room_tx VALUES(?,?)', tx, id);
   });

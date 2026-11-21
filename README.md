@@ -44,6 +44,8 @@ Linear room appends validate against committed room state. A deployed Worker acc
 
 An independent stock Synapse rotated its signing key while sharing a v11 room with the Worker. Its new key authenticated federation requests and messages on the first send after restart. The Worker retained the pre-rotation event and delivered a reply in the same room. Discovered keys carry event-time validity, including the retirement time for old keys. Only active keys authenticate HTTP requests.
 
+The deployed Worker passed Complement's upstream `TestGetMissingEventsGapFilling` and all four history visibility cases in `TestInboundCanReturnMissingEvents`. The test harness used an external TLS endpoint for the Complement federation server. Open public rooms start with shared history and private rooms start with joined-only history.
+
 An open account can use `POST /join/{roomIdOrAlias}` with a remote alias or a room ID and routing hints. Public joins verify the resident server, signed state, auth chain, join rules and server ACL before committing. A stock v11 room with 520 messages and joined-only history accepted two concurrent requests as one membership. A private room without an invitation refused the same client.
 
 SRV-based discovery, large membership and auth snapshots, restricted-room admission and broader Complement coverage remain cutover work.
