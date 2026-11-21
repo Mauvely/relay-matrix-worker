@@ -58,5 +58,32 @@ test('private v10 room requires an invitation and accepts a signed remote join e
     fedRoom(home, server, peer, 'PUT', ['send_join', room, eventId(p)], new URLSearchParams(), p);
   assert.deepEqual(await join(), await join());
   const initial = await roomSync(home, server, user, 0, true);
-  assert.ok(initial.rooms.join[room].timeline.events.some((e) => e.sender === other));
+  const timeline = initial.rooms.join[room].timeline;
+  assert.ok(timeline.events.some((e) => e.sender === other));
+  const messages = (user_id, opts) =>
+    roomClient(
+      home,
+      server,
+      { user_id },
+      'GET',
+      [room, 'messages'],
+      undefined,
+      new URLSearchParams(opts)
+    ).then((r) => r.body);
+  const oldest = await messages(user, { dir: 'b', from: timeline.prev_batch });
+  assert.deepEqual(oldest.chunk, []);
+  assert.equal(oldest.end, undefined);
+  const newest = await messages(user, { dir: 'b', limit: 1 });
+  assert.equal(newest.chunk[0].event_id, timeline.events.at(-1).event_id);
+  const rest = await messages(user, { dir: 'b', from: newest.end });
+  assert.deepEqual(
+    [newest.chunk[0], ...rest.chunk].map((e) => e.event_id),
+    timeline.events.map((e) => e.event_id).reverse()
+  );
+  assert.deepEqual(
+    (await messages(other, { dir: 'f' })).chunk.map((e) => e.event_id),
+    [eventId(p)]
+  );
+  await assert.rejects(messages(user, { dir: 'b', from: '!another:server/9' }), /history token/);
+  await assert.rejects(messages('@stranger:' + server, { dir: 'b' }), /membership/i);
 });

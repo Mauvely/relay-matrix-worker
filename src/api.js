@@ -31,7 +31,7 @@ export async function clientApi(home, server, auth, method, parts, params, body)
   if (method === 'POST' && parts[0] === 'createRoom') return create(home, server, user, body);
   if (method === 'POST' && parts[0] === 'join')
     return roomClient(home, server, auth, method, [parts[1], 'join'], body);
-  if (parts[0] === 'rooms') return roomClient(home, server, auth, method, parts.slice(1), body);
+  if (parts[0] === 'rooms') return roomClient(home, server, auth, method, parts.slice(1), body, params);
   if (parts[0] === 'joined_rooms' && method === 'GET') {
     const rows = home.sql
       .exec(

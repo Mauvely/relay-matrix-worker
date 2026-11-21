@@ -176,7 +176,83 @@ export async function create(home, server, user, data) {
   commit(home, server, g, [...g.events.values()]);
   return ok({ room_id: room });
 }
-export async function roomClient(home, server, auth, method, parts, data) {
+function pageToken(room, seq) {
+  return room + '/' + seq;
+}
+
+function pagePosition(room, value, fallback) {
+  if (value === null || value === '') return fallback;
+  const prefix = room + '/';
+  const seq = value.startsWith(prefix) ? value.slice(prefix.length) : '';
+  if (!/^\d+$/.test(seq) || !Number.isSafeInteger(Number(seq))) invalid('Invalid room history token');
+  return Number(seq);
+}
+
+function messagePage(home, room, joinId, params) {
+  const dir = params.get('dir');
+  if (!['b', 'f'].includes(dir)) invalid('Expected a history direction');
+  const backwards = dir === 'b';
+  const floor = home.sql.exec('SELECT seq FROM room_events WHERE eid=?', joinId).one().seq;
+  const ceiling = home.sql.exec('SELECT MAX(seq)+1 AS n FROM room_events WHERE room=?', room).one().n;
+  const from = pagePosition(room, params.get('from'), backwards ? ceiling : floor);
+  const to = pagePosition(room, params.get('to'), backwards ? floor : ceiling);
+  const limit = Number(params.get('limit') ?? 10);
+  if (!Number.isSafeInteger(limit) || limit < 0) invalid('Invalid history limit');
+  const filter = JSON.parse(params.get('filter') || '{}');
+  if (!isObject(filter)) invalid('Invalid room filter');
+  const rows = home.sql
+    .exec(
+      'SELECT seq,eid,pdu FROM room_events WHERE room=? AND seq>=? AND seq<? ORDER BY seq ' +
+        (backwards ? 'DESC' : 'ASC'),
+      room,
+      Math.max(floor, backwards ? to : from),
+      Math.min(ceiling, backwards ? from : to)
+    )
+    .toArray();
+  const matches = (patterns, text, glob) =>
+    patterns?.some((pattern) => {
+      if (typeof pattern !== 'string') invalid('Invalid room filter');
+      if (!glob) return pattern === text;
+      const pieces = pattern.split('*');
+      if (pieces.length === 1) return text === pattern;
+      const first = pieces.shift(),
+        last = pieces.pop();
+      if (!text.startsWith(first) || !text.endsWith(last)) return false;
+      let pos = first.length;
+      for (const part of pieces) {
+        const match = text.indexOf(part, pos);
+        if (match < 0) return false;
+        pos = match + part.length;
+      }
+      return pos <= text.length - last.length;
+    });
+  const page = [];
+  let last;
+  for (const row of rows) {
+    const e = clientEvent(JSON.parse(row.pdu), row.eid);
+    if (
+      (filter.types && !matches(filter.types, e.type, true)) ||
+      matches(filter.not_types, e.type, true) ||
+      (filter.senders && !matches(filter.senders, e.sender)) ||
+      matches(filter.not_senders, e.sender) ||
+      (filter.rooms && !matches(filter.rooms, room)) ||
+      matches(filter.not_rooms, room) ||
+      ('contains_url' in filter && filter.contains_url !== (typeof e.content?.url === 'string'))
+    )
+      continue;
+    if (page.length >= Math.min(limit, 100)) break;
+    last = row.seq;
+    page.push(e);
+  }
+  const more = last !== undefined && rows.at(-1)?.seq !== last;
+  return ok({
+    start: pageToken(room, from),
+    chunk: page,
+    ...(more ? { end: pageToken(room, backwards ? last : last + 1) } : {})
+  });
+}
+
+export async function roomClient(home, server, auth, method, parts, data, params = new URLSearchParams()) {
   const [room, action, kind, key] = parts,
     user = auth.user_id;
   await openParty(home, server, user);
@@ -194,6 +270,8 @@ export async function roomClient(home, server, auth, method, parts, data) {
     )
   )
     denied('Room membership required');
+  if (method === 'GET' && action === 'messages')
+    return messagePage(home, room, eventId(g.get('m.room.member', user)), params);
   if (method === 'GET' && action === 'state') {
     if (kind) {
       const e = g.get(kind, key ?? '');
@@ -367,7 +445,7 @@ export async function roomSync(home, server, user, cursor, initial) {
       const joinedNow = initial || sinceJoin > cursor;
       const rows = home.sql
         .exec(
-          'SELECT pdu,eid FROM room_events WHERE room=? AND seq>=? ORDER BY seq',
+          'SELECT seq,pdu,eid FROM room_events WHERE room=? AND seq>=? ORDER BY seq',
           row.room,
           Math.max(sinceJoin, cursor + 1)
         )
@@ -377,7 +455,11 @@ export async function roomSync(home, server, user, cursor, initial) {
       const state = joinedNow ? stateEvents.filter((e) => !timelineIds.has(e.event_id)) : [];
       rooms.join[row.room] = {
         state: { events: state },
-        timeline: { events, limited: false },
+        timeline: {
+          events,
+          limited: false,
+          ...(rows.length ? { prev_batch: pageToken(row.room, rows[0].seq) } : {})
+        },
         ephemeral: { events: [] },
         account_data: { events: [] }
       };
