@@ -127,6 +127,8 @@ test('notification tap looks up the exact message and context within joined hist
   assert.equal(minimal.event.event_id, target);
   assert.deepEqual([minimal.events_before, minimal.events_after, minimal.state], [[], [], []]);
   await roomClient(home, server, bob, 'POST', [room, 'leave'], {});
+  assert.equal((await read('context', target)).event.event_id, target);
+  await roomClient(home, server, bob, 'POST', [room, 'forget'], {});
   await assert.rejects(read('context', target), { status: 403 });
 });
 

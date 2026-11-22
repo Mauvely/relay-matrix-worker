@@ -366,3 +366,39 @@ test('Element X gets a window, authorised room state and incremental timeline ti
   const stranger=await slidingSync(home,server,{...auth,user_id:'@outside:'+server},{room_subscriptions:{[room]:{timeline_limit:20}}},'');
   assert.deepEqual(Object.keys(stranger.rooms),[]);
 });
+
+test('leaving retains a bounded attachment history and forgetting removes it for that account', async () => {
+  const sql = memorySql(), server = 'worker.test', owner = '@owner:'+server, guest = '@guest:'+server;
+  const home = {sql, waiters:new Map(), identity:await createIdentity(),
+    ctx:{storage:{transactionSync:f=>f()}}, party:async()=>({organisationId:null}), env:{}};
+  schema(sql);
+  const {body:{room_id:room}} = await create(home,server,owner,{room_version:'11'});
+  const request = (user, method, parts, data={}, params=new URLSearchParams()) =>
+    roomClient(home,server,{user_id:user,device_id:'device'},method,[room,...parts],data,params);
+  const send = async label => (await request(owner,'PUT',['send','m.room.encrypted',label],{ciphertext:label})).body.event_id;
+  const before = await send('before');
+  await request(owner,'POST',['invite'],{user_id:guest});
+  await request(guest,'POST',['join']);
+  const visible = await send('shared');
+  await assert.rejects(request(guest,'POST',['forget']), e => e.status===400);
+  await request(guest,'POST',['leave']);
+  const later = await send('after');
+  const history = async () => (await request(guest,'GET',['messages'],{},new URLSearchParams({dir:'b'}))).body.chunk;
+  assert.deepEqual((await history()).filter(e=>e.type==='m.room.encrypted').map(e=>e.event_id),[visible]);
+  const context = (await request(guest,'GET',['context',visible])).body;
+  assert.equal(context.event.content.ciphertext,'shared');
+  assert.ok(![...context.events_before,...context.events_after].some(e=>e.event_id===later || e.event_id===before));
+  await assert.rejects(request(guest,'GET',['event',later]), e=>e.status===404);
+  await assert.rejects(request(guest,'PUT',['send','m.room.encrypted','left'],{}),e=>e.status===403);
+  await request(guest,'POST',['forget']);
+  await request(guest,'POST',['forget']);
+  await assert.rejects(history(),e=>e.status===403);
+  assert.equal((await roomSync(home,server,guest,0,false)).rooms.leave[room],undefined);
+  assert.equal((await request(owner,'GET',['event',visible])).body.content.ciphertext,'shared');
+  await request(owner,'POST',['invite'],{user_id:guest});
+  assert.ok((await roomSync(home,server,guest,0,true)).rooms.invite[room]);
+  await request(guest,'POST',['join']);
+  await assert.rejects(request(guest,'GET',['event',visible]),e=>e.status===404);
+  const fresh = await send('new');
+  assert.equal((await request(guest,'GET',['event',fresh])).body.content.ciphertext,'new');
+});

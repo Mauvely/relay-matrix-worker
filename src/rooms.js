@@ -38,6 +38,7 @@ export function schema(sql) {
     CREATE INDEX IF NOT EXISTS gap_expiry ON federation_gap_events(expires);
     CREATE TABLE IF NOT EXISTS room_tips(room TEXT,eid TEXT,PRIMARY KEY(room,eid));
     CREATE TABLE IF NOT EXISTS profile_updates(server TEXT,user TEXT,room TEXT,due INTEGER DEFAULT 0,PRIMARY KEY(user,room));
+    CREATE TABLE IF NOT EXISTS room_forgets(room TEXT,user TEXT,member_eid TEXT NOT NULL,PRIMARY KEY(room,user));
     CREATE TABLE IF NOT EXISTS room_tx(id TEXT PRIMARY KEY,eid TEXT);
     CREATE TABLE IF NOT EXISTS outbound(id TEXT PRIMARY KEY,server TEXT,peer TEXT,path TEXT,content TEXT);
     CREATE TABLE IF NOT EXISTS received(id TEXT PRIMARY KEY,response TEXT);
@@ -299,12 +300,12 @@ function pagePosition(room, value, fallback) {
 
 // A profile update is another membership event with membership=join. It must not
 // move the history boundary. A leave followed by a rejoin establishes a new one.
-export function joinFloor(home, room, user) {
+export function joinFloor(home, room, user, before = Number.MAX_SAFE_INTEGER) {
   return home.sql.exec(`SELECT MIN(seq) AS floor FROM room_client_events WHERE room=?1
     AND json_extract(pdu,'$.type')='m.room.member' AND json_extract(pdu,'$.state_key')=?2
-    AND json_extract(pdu,'$.content.membership')='join' AND seq>COALESCE((
+    AND json_extract(pdu,'$.content.membership')='join' AND seq<?3 AND seq>COALESCE((
       SELECT MAX(seq) FROM room_client_events WHERE room=?1 AND json_extract(pdu,'$.type')='m.room.member'
-      AND json_extract(pdu,'$.state_key')=?2 AND json_extract(pdu,'$.content.membership')!='join'),0)`,room,user).one().floor;
+      AND json_extract(pdu,'$.state_key')=?2 AND seq<?3 AND json_extract(pdu,'$.content.membership')!='join'),0)`,room,user,before).one().floor;
 }
 
 function matchesRoomFilter(e, room, filter) {
@@ -336,13 +337,10 @@ function matchesRoomFilter(e, room, filter) {
   );
 }
 
-function messagePage(home, room, user, params) {
+function messagePage(home, room, params, floor, ceiling) {
   const dir = params.get('dir');
   if (!['b', 'f'].includes(dir)) invalid('Expected a history direction');
   const backwards = dir === 'b';
-  const floor = joinFloor(home, room, user);
-  if (floor === null) denied('No local room membership');
-  const ceiling = home.sql.exec('SELECT MAX(seq)+1 AS n FROM room_client_events WHERE room=?', room).one().n;
   const from = pagePosition(room, params.get('from'), backwards ? ceiling : floor);
   const to = pagePosition(room, params.get('to'), backwards ? floor : ceiling);
   const limit = Number(params.get('limit') ?? 10);
@@ -375,10 +373,9 @@ function messagePage(home, room, user, params) {
   });
 }
 
-function eventLookup(home, server, room, user, action, id, params) {
-  const floor = joinFloor(home, room, user);
+function eventLookup(home, server, room, action, id, params, floor, ceiling) {
   const target = home.sql.exec(
-    'SELECT seq,eid,pdu FROM room_client_events WHERE room=? AND eid=? AND seq>=?', room, id, floor
+    'SELECT seq,eid,pdu FROM room_client_events WHERE room=? AND eid=? AND seq>=? AND seq<?', room, id, floor, ceiling
   ).toArray()[0];
   if (!target) missing();
   const event = clientEvent(JSON.parse(target.pdu), target.eid);
@@ -393,8 +390,8 @@ function eventLookup(home, server, room, user, action, id, params) {
     if (!size) return [];
     const direction = backwards ? 'seq<? ORDER BY seq DESC' : 'seq>? ORDER BY seq ASC';
     return home.sql.exec(
-      'SELECT seq,eid,pdu FROM room_client_events WHERE room=? AND seq>=? AND ' + direction + ' LIMIT ?',
-      room, floor, target.seq, size
+      'SELECT seq,eid,pdu FROM room_client_events WHERE room=? AND seq>=? AND seq<? AND ' + direction + ' LIMIT ?',
+      room, floor, ceiling, target.seq, size
     ).toArray().map(row => ({seq: row.seq, event: clientEvent(JSON.parse(row.pdu), row.eid)}))
       .filter(row => matchesRoomFilter(row.event, room, filter));
   };
@@ -417,10 +414,37 @@ export async function roomClient(home, server, auth, method, parts, data, params
   const g = load(home, server, room);
   if (!g.tips.size) missing();
   await checkParties(home, server, g);
-  const membership = g.get('m.room.member', user)?.content.membership;
+  const memberId = g.state.get(JSON.stringify(['m.room.member', user]));
+  const membership = g.events.get(memberId)?.content.membership;
+  const left = membership === 'leave' || membership === 'ban';
+  if (method === 'POST' && action === 'forget' && parts.length === 2) {
+    if (!memberId) missing();
+    if (!left) fail(400, 'M_UNKNOWN', 'Leave the room before forgetting it');
+    home.sql.exec('INSERT INTO room_forgets VALUES(?,?,?) ON CONFLICT(room,user) DO UPDATE SET member_eid=excluded.member_eid',
+      room, user, memberId);
+    return ok();
+  }
+  const byId = ['event','context'].includes(action) && kind && parts.length === 3;
+  if (method === 'GET' && (byId || (action === 'messages' && parts.length === 2))) {
+    if (!left && membership !== 'join') denied('Room membership required');
+    let ceiling;
+    if (left) {
+      if (home.sql.exec('SELECT 1 FROM room_forgets WHERE room=? AND user=? AND member_eid=?', room, user, memberId).toArray().length)
+        denied('Room was forgotten');
+      const departure = home.sql.exec('SELECT seq FROM room_client_events WHERE room=? AND eid=?', room, memberId).toArray()[0];
+      if (!departure) denied('No local departure record');
+      ceiling = departure.seq + 1;
+    } else {
+      ceiling = home.sql.exec('SELECT MAX(seq)+1 AS n FROM room_client_events WHERE room=?', room).one().n;
+    }
+    const floor = joinFloor(home, room, user, left ? ceiling - 1 : ceiling);
+    if (floor === null) denied('No local room membership');
+    return byId ? eventLookup(home, server, room, action, kind, params, floor, ceiling)
+      : messagePage(home, room, params, floor, ceiling);
+  }
   if (method === 'POST' && action === 'join' && membership === 'join') return ok({ room_id: room });
   if (
-    membership !== 'join' &&
+    membership !== 'join' && !(method === 'POST' && action === 'leave' && membership === 'invite') &&
     !(
       method === 'POST' &&
       action === 'join' &&
@@ -428,10 +452,6 @@ export async function roomClient(home, server, auth, method, parts, data, params
     )
   )
     denied('Room membership required');
-  if (method === 'GET' && ['event', 'context'].includes(action) && kind && parts.length === 3)
-    return eventLookup(home, server, room, user, action, kind, params);
-  if (method === 'GET' && action === 'messages')
-    return messagePage(home, room, user, params);
   if (method === 'GET' && action === 'state') {
     if (kind) {
       const e = g.get(kind, key ?? '');
@@ -677,12 +697,20 @@ export async function roomSync(home, server, user, cursor, initial) {
   const rooms = { join: {}, invite: {}, leave: {} },
     changed = new Set();
   const memberships = home.sql.exec(
-    'SELECT s.room,e.pdu FROM room_state s JOIN room_known_events e ON e.eid=s.eid WHERE kind=? AND skey=?',
+    `SELECT s.room,s.eid,e.pdu FROM room_state s JOIN room_known_events e ON e.eid=s.eid WHERE kind=? AND skey=?
+       AND NOT EXISTS(SELECT 1 FROM room_forgets f WHERE f.room=s.room AND f.user=s.skey AND f.member_eid=s.eid)`,
     'm.room.member',
     user
   );
   for (const row of memberships.toArray()) {
     const membership = JSON.parse(row.pdu).content.membership;
+    if (membership === 'leave' || membership === 'ban') {
+      if (!initial && home.sql.exec('SELECT 1 FROM room_client_events WHERE room=? AND eid=? AND seq>?',
+        row.room, row.eid, cursor).toArray().length) {
+        rooms.leave[row.room] = { timeline: { events: [clientEvent(JSON.parse(row.pdu), row.eid)], limited: false }, state: { events: [] } };
+      }
+      continue;
+    }
     if (
       !initial &&
       !home.sql.exec('SELECT 1 FROM room_client_events WHERE room=? AND seq>? LIMIT 1', row.room, cursor).toArray()
@@ -759,11 +787,7 @@ export async function roomSync(home, server, user, cursor, initial) {
         ? members.filter((m) => m.content.membership === 'join')
         : events.filter((e) => e.type === 'm.room.member'))
         changed.add(m.state_key);
-    } else if (!initial)
-      rooms.leave[row.room] = {
-        timeline: { events: [own], limited: false },
-        state: { events: [] }
-      };
+    }
   }
   return { rooms, high, changed: [...changed] };
 }

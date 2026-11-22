@@ -115,7 +115,7 @@ function roomEntries(home, user, seen) {
   }
   for (const row of sql
     .exec(
-      "SELECT s.room,s.eid,e.pdu FROM room_state s JOIN room_known_events e ON e.eid=s.eid AND e.room=s.room WHERE s.kind='m.room.member' AND s.skey=?",
+      "SELECT s.room,s.eid,e.pdu FROM room_state s JOIN room_known_events e ON e.eid=s.eid AND e.room=s.room WHERE s.kind='m.room.member' AND s.skey=? AND NOT EXISTS(SELECT 1 FROM room_forgets f WHERE f.room=s.room AND f.user=s.skey AND f.member_eid=s.eid)",
       user
     )
     .toArray()) {
