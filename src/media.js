@@ -26,6 +26,21 @@ export function packMedia(bytes, type, boundary) {
     '\r\n--' + boundary + '--\r\n'
   ]);
 }
+// Vault media can exceed a Worker's memory limit. Frame the authenticated federation response as a stream.
+function federationMediaStream(body, boundary) {
+  const bytes = new TextEncoder(), reader = body.getReader();
+  return new ReadableStream({
+    start(c) {
+      c.enqueue(bytes.encode('--'+boundary+'\r\nContent-Type: application/json\r\n\r\n{}\r\n--'+boundary+'\r\nContent-Type: application/octet-stream\r\n\r\n'));
+    },
+    async pull(c) {
+      const part = await reader.read();
+      if (part.done) { c.enqueue(bytes.encode('\r\n--'+boundary+'--\r\n')); c.close(); }
+      else c.enqueue(part.value);
+    },
+    cancel(reason) { return reader.cancel(reason); }
+  });
+}
 export function unpackMedia(buffer, type) {
   const boundary = /(?:^|;)\s*boundary=(?:"([^"]+)"|([^;\s]+))/i.exec(type);
   if (!boundary) throw Error('Missing media boundary');
@@ -67,6 +82,7 @@ export async function limited(stream, limit) {
   return bytes.buffer;
 }
 async function readLocal(env, home, server, id) {
+  if (id.startsWith('vault-')) return env.CLOUD_MEDIA?.readRevision(server, id.slice(6));
   if (!id.startsWith('cloud-')) return home.mediaRead(id);
   if (!env.CLOUD_MEDIA) throw Error('Hosted media storage unavailable');
   return env.CLOUD_MEDIA.read(server, id.slice(6));
@@ -78,7 +94,8 @@ export async function mediaRoute(request, env, server, home, path, json) {
     /^\/_matrix\/(?:media\/(?:v3|r0)|client\/v1\/media)\/(config|upload|download|thumbnail)(?:\/([^/]+)\/([^/]+)(?:\/[^/]*)?)?$/.exec(
       path
     );
-  if (!fed && !client) return;
+  const publish = path === '/_matrix/client/unstable/com.mauvely.cloud/publish';
+  if (!fed && !client && !publish) return;
   if (fed) {
     if (
       request.method !== 'GET' ||
@@ -88,18 +105,35 @@ export async function mediaRoute(request, env, server, home, path, json) {
     const m = await readLocal(env, home, server, fed[1]);
     if (!m) return json({ errcode: 'M_NOT_FOUND', error: 'Unknown media' }, 404);
     const boundary = crypto.randomUUID();
-    return new Response(packMedia(m.body, m.type, boundary), {
+    const payload = m.body instanceof ReadableStream ? federationMediaStream(m.body,boundary) : packMedia(m.body, m.type, boundary);
+    return new Response(payload, {
       headers: { 'Content-Type': 'multipart/mixed; boundary=' + boundary }
     });
   }
   const auth = await home.session(request.headers.get('Authorization'), false);
   if (auth.status !== 200) return json(auth.body, auth.status);
-  if (client[1] === 'config' || client[1] === 'upload') {
+  if (publish || client[1] === 'config' || client[1] === 'upload') {
     const payer = await home.mediaAccount(server, auth.body.user_id);
     const limit = payer ? hostedLimit : mediaLimit;
     if (payer && !env.CLOUD_MEDIA)
       return json({errcode:'M_UNAVAILABLE',error:'Hosted media storage unavailable'},503);
-    if (client[1] === 'config' && request.method === 'GET') return json({'m.upload.size':limit});
+    if (publish) {
+      if (request.method !== 'POST') return json({errcode:'M_UNRECOGNIZED',error:'Use POST'},405);
+      if (!payer || !(await home.mediaAllowed(server, auth.body.user_id))) {
+        return json({errcode:'M_FORBIDDEN',error:'Cloud attach unavailable for this account'},403);
+      }
+      let spec;
+      try { spec = JSON.parse(new TextDecoder().decode(await limited(request.body, 1024))); }
+      catch { return json({errcode:'M_BAD_JSON',error:'Invalid revision'},400); }
+      if (!/^nod_[a-zA-Z0-9_-]{1,60}$/.test(spec?.nodeId) || !/^rev_[a-zA-Z0-9_-]{1,60}$/.test(spec?.revisionId)) {
+        return json({errcode:'M_INVALID_PARAM',error:'Invalid revision'},400);
+      }
+      const id = await env.CLOUD_MEDIA.publishRevision(server,payer,spec.nodeId,spec.revisionId);
+      return id ? json({content_uri:'mxc://'+server+'/vault-'+id}) : json({errcode:'M_NOT_FOUND',error:'Cloud revision unavailable'},404);
+    }
+    if (client[1] === 'config' && request.method === 'GET') {
+      return json({'m.upload.size':limit, ...(payer && await home.mediaAllowed(server,auth.body.user_id) ? {'com.mauvely.cloud_revisions':true} : {})});
+    }
     if (client[1] === 'upload' && request.method === 'POST') {
       if (!(await home.mediaAllowed(server, auth.body.user_id)))
         return json({errcode:'M_FORBIDDEN',error:'This account cannot share media'},403);

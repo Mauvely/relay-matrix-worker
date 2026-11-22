@@ -45,3 +45,33 @@ test('hosted media uses the authenticated payer and downloads from the origin na
   delete env.CLOUD_MEDIA;
   assert.equal((await call(upload,{method:'POST',body:'no storage binding'})).status,503);
 });
+
+test('a hosted account publishes an existing revision and downloads its ciphertext', async () => {
+  const {mediaRoute} = await import('./src/media.js');
+  const server = 'home.test', owner = '@owner:home.test';
+  const source = new Uint8Array([0, 255, 7]);
+  const path = '/_matrix/client/unstable/com.mauvely.cloud/publish';
+  const home = {session:async()=>({status:200,body:{user_id:owner}}),
+    mediaAccount:async()=> 'account-owner', mediaAllowed:async()=>true};
+  const env = {CLOUD_MEDIA:{
+    publishRevision: async (...args) => {
+      assert.deepEqual(args,[server,'account-owner','nod_known','rev_known']);
+      return 'first';
+    },
+    readRevision: async (origin,id) => {
+      assert.equal(origin,server);
+      assert.equal(id,'first');
+      return {type:'application/octet-stream',length:3,body:new Blob([source]).stream()};
+    }
+  }};
+  const route = (path, init) => mediaRoute(new Request('https://home.test'+path,init),env,server,home,path,
+    (data,status=200)=>Response.json(data,{status}));
+  const init={method:'POST',body:JSON.stringify({nodeId:'nod_known',revisionId:'rev_known'})};
+  assert.deepEqual(await (await route(path,init)).json(), {content_uri:'mxc://home.test/vault-first'});
+  const get = await route('/_matrix/client/v1/media/download/home.test/vault-first');
+  assert.deepEqual(new Uint8Array(await get.arrayBuffer()),source);
+  home.mediaAllowed=async()=>false;
+  assert.equal((await route(path,init)).status,403);
+  home.mediaAccount=async()=>null;
+  assert.equal((await route(path,init)).status,403);
+});
