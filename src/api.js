@@ -11,6 +11,7 @@ import {
   missing,
   isObject
 } from './rooms.js';
+import { pusherApi, rulesApi } from './push.js';
 import { remote } from './federation.js';
 import { limited } from './media.js';
 import { clearGap } from './gaps.js';
@@ -22,16 +23,8 @@ import { eventId, domain } from './graph.js';
 export async function clientApi(home, server, auth, method, parts, params, body) {
   const user = auth.user_id;
   if (parts[0] === 'room_keys') return backup(home, user, method, parts.slice(1), params, body);
-  if (parts[0] === 'pushrules' && method === 'GET')
-    return ok({
-      global: {
-        override: [],
-        content: [],
-        room: [],
-        sender: [],
-        underride: []
-      }
-    });
+  if (parts[0] === 'pushers') return pusherApi(home, auth, method, parts, body);
+  if (parts[0] === 'pushrules') return rulesApi(home, user, method, parts, params, body);
   if (parts[0] === 'thirdparty' && parts[1] === 'protocols' && method === 'GET') return ok({});
   if (parts[0] === 'voip' && parts[1] === 'turnServer' && method === 'GET') {
     if (!home.env.TURN_PROVIDER) return ok({uris:[]});
@@ -122,6 +115,7 @@ export async function clientApi(home, server, auth, method, parts, params, body)
       if (filter && method === 'GET') return ok(filter);
     }
     if (parts[2] === 'account_data' && parts[3]) {
+      if (parts[3]==='m.push_rules' && method==='PUT') fail(400,'M_INVALID_PARAM','Use the push rules endpoint');
       if (method === 'PUT') {
         home.sql.exec(
           'INSERT OR REPLACE INTO user_data(user,kind,content) VALUES(?,?,?)',

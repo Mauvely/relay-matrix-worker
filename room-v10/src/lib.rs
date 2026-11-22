@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! Offline replay of a complete, topologically ordered room trace.
 //! The caller supplies trusted public keys separately from the signed PDUs.
+mod push;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use ruma_common::{CanonicalJsonObject, MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedRoomId,
     OwnedUserId, RoomId, UserId, room_version_rules::RoomVersionRules};

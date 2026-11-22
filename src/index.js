@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 import { logoutSession, reconcileSessions, sessionSchema } from './device-sessions.js';
+import { dispatchPush, rulesFor } from './push.js';
 import { deliver, syncDevices } from './device.js';
 import { slidingPath, slidingSchema, slidingSync } from './sliding.js';
 import { approveOAuth, oauthOperation, oauthRoute, oauthSchema, oauthSession } from './oauth.js';
@@ -181,11 +182,19 @@ export class Homeserver extends DurableObject {
     return JSON.parse(JSON.stringify(result));
   }
   async scheduleOutbound() {
-    if (
-      this.sql.exec('SELECT 1 FROM outbound LIMIT 1').toArray().length &&
-      (await this.ctx.storage.getAlarm()) === null
-    )
-      await this.ctx.storage.setAlarm(Date.now() + 20);
+    const sql = this.sql;
+    const next = sql
+      .exec(
+        'SELECT MIN(COALESCE(r.due,0)) AS due FROM outbound o LEFT JOIN retry r ON o.id=r.id WHERE NOT EXISTS (SELECT 1 FROM outbound earlier WHERE earlier.peer=o.peer AND earlier.rowid<o.rowid)'
+      )
+      .one().due;
+    const profiles = sql.exec('SELECT MIN(due) AS due FROM profile_updates').one().due;
+    const push = sql.exec('SELECT MIN(due) AS n FROM push_jobs').one().n;
+    const due = [next, profiles, push].filter((value) => value !== null);
+    if (!due.length) return;
+    const time = Math.max(Date.now() + 10, Math.min(...due));
+    const scheduled = await this.ctx.storage.getAlarm();
+    if (scheduled === null || scheduled > time) await this.ctx.storage.setAlarm(time);
   }
   async mediaAccount(server, user) {
     if (!user.endsWith(':' + server)) throw Error('Wrong homeserver for upload');
@@ -231,6 +240,7 @@ export class Homeserver extends DurableObject {
     return {backlog,next:next ? {...next} : null,rejected};
   }
   async alarm() {
+    await dispatchPush(this);
     for (const {server,user,room} of this.sql.exec('SELECT * FROM profile_updates WHERE due<=? LIMIT 8', Date.now()).toArray()) {
       try {
         await this.ctx.blockConcurrencyWhile(async () => {
@@ -282,14 +292,7 @@ export class Homeserver extends DurableObject {
         console.warn('Federation delivery pending', r.peer, e.message);
       }
     }
-    const next = sql
-      .exec(
-        'SELECT MIN(COALESCE(r.due,0)) AS due FROM outbound o LEFT JOIN retry r ON o.id=r.id WHERE NOT EXISTS (SELECT 1 FROM outbound earlier WHERE earlier.peer=o.peer AND earlier.rowid<o.rowid)'
-      )
-      .one().due;
-    const profiles = sql.exec('SELECT MIN(due) AS due FROM profile_updates').one().due;
-    const due = [next, profiles].filter((value) => value !== null);
-    if (due.length) await this.ctx.storage.setAlarm(Math.max(Date.now()+10,Math.min(...due)));
+    await this.scheduleOutbound();
   }
   rendezvous(method,id,data,tag) { return exchange(this.sql,method,id,data,tag); }
   approveOAuth(server,accountId,target) {
@@ -328,6 +331,10 @@ export class Homeserver extends DurableObject {
     return remoteInvites(this, user, cursor, initial);
   }
   userUpdates(user, cursor) {
+    // A real account-data stream position gives already-signed-in devices the defaults on upgrade.
+    if (!this.sql.exec("SELECT 1 FROM user_data WHERE user=? AND kind='m.push_rules'",user).toArray().length)
+      this.sql.exec("INSERT INTO user_data(user,kind,content) VALUES(?,'m.push_rules',?)",user,
+        JSON.stringify({global:rulesFor(this.sql,user)}));
     const rows = this.sql
       .exec('SELECT * FROM user_data WHERE user=? AND seq>? ORDER BY seq', user, cursor)
       .toArray();

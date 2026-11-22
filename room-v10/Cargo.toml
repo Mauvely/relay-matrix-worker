@@ -6,6 +6,7 @@ license = "AGPL-3.0-or-later"
 [lib]
 crate-type = ["cdylib"]
 [dependencies]
+futures-util = { version = "0.3", default-features = false }
 ruma-state-res = "0.19"
 ruma-common = { version = "0.21", features = ["js"] }
 ruma-events = "0.36"

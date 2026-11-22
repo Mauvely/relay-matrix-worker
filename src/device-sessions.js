@@ -19,6 +19,7 @@ function removeDevice(home, user, device) {
   ))
     home.ctx.storage.kv.delete('session/' + hash);
   for (const table of [
+    'pushers',
     'legacy_device_tokens',
     'oauth_sessions',
     'devices',

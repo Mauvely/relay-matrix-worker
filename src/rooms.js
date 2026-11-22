@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
+import { pushSchema, queuePush } from './push.js';
 import { canonical } from './identity.js';
 import { canReadEvent, disclosedEvent, saveAudience, missingEvents } from './history.js';
 import { acl_allows } from '../room-v10/pkg/relay_room_v10.js';
@@ -17,6 +18,7 @@ const invalid = (msg) => fail(400, 'M_INVALID_PARAM', msg);
 const unready = (msg) => fail(503, 'M_UNAVAILABLE', msg);
 export const isObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
 export function schema(sql) {
+  pushSchema(sql);
   sql.exec(`CREATE TABLE IF NOT EXISTS room_events(seq INTEGER PRIMARY KEY AUTOINCREMENT,room TEXT,eid TEXT UNIQUE,pdu TEXT);
     CREATE TABLE IF NOT EXISTS room_ancestry(seq INTEGER PRIMARY KEY,room TEXT NOT NULL,eid TEXT NOT NULL,UNIQUE(room,eid));
     CREATE TABLE IF NOT EXISTS room_soft_failures(room TEXT,eid TEXT,PRIMARY KEY(room,eid));
@@ -146,6 +148,7 @@ export function queue(home, server, peer, pdus, edus = []) {
 function commit(home, server, g, events, extra) {
   home.ctx.storage.transactionSync(() => {
     save(home, g, events);
+    if (events.length) queuePush(home,server,g,events.at(-1));
     if (g.softFailed?.size) events = events.filter(event => !g.softFailed.has(eventId(event,g.version)));
     for (const peer of new Set(g.members('join').map((e) => domain(e.state_key))))
       if (peer !== server && events.some((e) => domain(e.sender) === server))
@@ -156,6 +159,10 @@ function commit(home, server, g, events, extra) {
           events.filter((e) => domain(e.sender) === server)
         );
     for (const event of events) {
+      if (event.type === 'm.room.member' && ['leave','ban'].includes(event.content.membership) &&
+          domain(event.state_key) === server)
+        home.sql.exec('DELETE FROM push_jobs WHERE room=? AND pusher IN (SELECT id FROM pushers WHERE user=?)',
+          g.room,event.state_key);
       if (
         event.type !== 'm.room.member' ||
         event.content.membership !== 'invite' ||
@@ -300,6 +307,35 @@ export function joinFloor(home, room, user) {
       AND json_extract(pdu,'$.state_key')=?2 AND json_extract(pdu,'$.content.membership')!='join'),0)`,room,user).one().floor;
 }
 
+function matchesRoomFilter(e, room, filter) {
+  const matches = (patterns, text, glob) =>
+    patterns?.some((pattern) => {
+      if (typeof pattern !== 'string') invalid('Invalid room filter');
+      if (!glob) return pattern === text;
+      const pieces = pattern.split('*');
+      if (pieces.length === 1) return text === pattern;
+      const first = pieces.shift(),
+        last = pieces.pop();
+      if (!text.startsWith(first) || !text.endsWith(last)) return false;
+      let pos = first.length;
+      for (const part of pieces) {
+        const match = text.indexOf(part, pos);
+        if (match < 0) return false;
+        pos = match + part.length;
+      }
+      return pos <= text.length - last.length;
+    });
+  return !(
+    (filter.types && !matches(filter.types, e.type, true)) ||
+    matches(filter.not_types, e.type, true) ||
+    (filter.senders && !matches(filter.senders, e.sender)) ||
+    matches(filter.not_senders, e.sender) ||
+    (filter.rooms && !matches(filter.rooms, room)) ||
+    matches(filter.not_rooms, room) ||
+    ('contains_url' in filter && filter.contains_url !== (typeof e.content?.url === 'string'))
+  );
+}
+
 function messagePage(home, room, user, params) {
   const dir = params.get('dir');
   if (!['b', 'f'].includes(dir)) invalid('Expected a history direction');
@@ -322,23 +358,6 @@ function messagePage(home, room, user, params) {
       Math.min(ceiling, backwards ? from : to)
     )
     .toArray();
-  const matches = (patterns, text, glob) =>
-    patterns?.some((pattern) => {
-      if (typeof pattern !== 'string') invalid('Invalid room filter');
-      if (!glob) return pattern === text;
-      const pieces = pattern.split('*');
-      if (pieces.length === 1) return text === pattern;
-      const first = pieces.shift(),
-        last = pieces.pop();
-      if (!text.startsWith(first) || !text.endsWith(last)) return false;
-      let pos = first.length;
-      for (const part of pieces) {
-        const match = text.indexOf(part, pos);
-        if (match < 0) return false;
-        pos = match + part.length;
-      }
-      return pos <= text.length - last.length;
-    });
   const page = [];
   let last;
   let more = false;
@@ -346,23 +365,48 @@ function messagePage(home, room, user, params) {
     if (page.length >= Math.min(limit, 100) || (rows.length === 101 && row === rows[100])) { more = true; break; }
     last = row.seq;
     const e = clientEvent(JSON.parse(row.pdu), row.eid);
-    if (
-      (filter.types && !matches(filter.types, e.type, true)) ||
-      matches(filter.not_types, e.type, true) ||
-      (filter.senders && !matches(filter.senders, e.sender)) ||
-      matches(filter.not_senders, e.sender) ||
-      (filter.rooms && !matches(filter.rooms, room)) ||
-      matches(filter.not_rooms, room) ||
-      ('contains_url' in filter && filter.contains_url !== (typeof e.content?.url === 'string'))
-    )
-      continue;
-
+    if (!matchesRoomFilter(e, room, filter)) continue;
     page.push(e);
   }
   return ok({
     start: pageToken(room, from),
     chunk: page,
     ...(more && last !== undefined ? { end: pageToken(room, backwards ? last : last + 1) } : {})
+  });
+}
+
+function eventLookup(home, server, room, user, action, id, params) {
+  const floor = joinFloor(home, room, user);
+  const target = home.sql.exec(
+    'SELECT seq,eid,pdu FROM room_client_events WHERE room=? AND eid=? AND seq>=?', room, id, floor
+  ).toArray()[0];
+  if (!target) missing();
+  const event = clientEvent(JSON.parse(target.pdu), target.eid);
+  if (action === 'event') return ok(event);
+
+  const limit = Number(params.get('limit') ?? 10);
+  if (!Number.isSafeInteger(limit) || limit < 0) invalid('Invalid context limit');
+  const count = Math.min(limit, 100);
+  const filter = JSON.parse(params.get('filter') || '{}');
+  if (!isObject(filter)) invalid('Invalid room filter');
+  const surrounding = (backwards, size) => {
+    if (!size) return [];
+    const direction = backwards ? 'seq<? ORDER BY seq DESC' : 'seq>? ORDER BY seq ASC';
+    return home.sql.exec(
+      'SELECT seq,eid,pdu FROM room_client_events WHERE room=? AND seq>=? AND ' + direction + ' LIMIT ?',
+      room, floor, target.seq, size
+    ).toArray().map(row => ({seq: row.seq, event: clientEvent(JSON.parse(row.pdu), row.eid)}))
+      .filter(row => matchesRoomFilter(row.event, room, filter));
+  };
+  const before = surrounding(true, Math.floor(count / 2));
+  const after = surrounding(false, Math.ceil(count / 2));
+  const last = after.at(-1)?.seq ?? target.seq;
+  const senders = new Set([event.sender, ...before.map(row => row.event.sender), ...after.map(row => row.event.sender)]);
+  const state = stateBeforeStream(home, server, room, last + 1).filter(e =>
+    matchesRoomFilter(e, room, filter) && (!filter.lazy_load_members || e.type !== 'm.room.member' || senders.has(e.state_key)));
+  return ok({
+    event, events_before: before.map(row => row.event), events_after: after.map(row => row.event), state,
+    start: pageToken(room, before.at(-1)?.seq ?? target.seq), end: pageToken(room, last + 1)
   });
 }
 
@@ -384,6 +428,8 @@ export async function roomClient(home, server, auth, method, parts, data, params
     )
   )
     denied('Room membership required');
+  if (method === 'GET' && ['event', 'context'].includes(action) && kind && parts.length === 3)
+    return eventLookup(home, server, room, user, action, kind, params);
   if (method === 'GET' && action === 'messages')
     return messagePage(home, room, user, params);
   if (method === 'GET' && action === 'state') {
