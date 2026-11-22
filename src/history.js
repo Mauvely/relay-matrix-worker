@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
+import { prunedEvent } from './redactions.js';
 import { redact_event } from '../room-v10/pkg/relay_room_v10.js';
 import { domain } from './graph.js';
 
@@ -79,6 +80,8 @@ export function canReadEvent(sql, graph, peer, id, pdu, groups = new Map()) {
 }
 
 export function disclosedEvent(sql, graph, peer, id, pdu, groups = new Map()) {
+  const pruned = prunedEvent(sql, graph.room, id);
+  if (pruned) return JSON.parse(pruned.pdu);
   const { unsigned, ...signed } = pdu;
   return canReadEvent(sql,graph,peer,id,pdu,groups)
     ? signed : JSON.parse(redact_event(JSON.stringify(signed), graph.version));

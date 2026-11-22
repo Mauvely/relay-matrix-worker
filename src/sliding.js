@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
+import { projectedState } from './redactions.js';
 import { clientEvent } from './graph.js';
 import { fail, isObject, joinFloor, openParty, pageToken } from './rooms.js';
 import { permittedDeviceEvents } from './device.js';
@@ -131,7 +132,7 @@ function roomEntries(home, user, seen) {
             row.room
           )
           .toArray()
-          .map((r) => clientEvent(JSON.parse(r.pdu), r.eid))
+          .map((r) => projectedState(sql, row.room, r.eid, JSON.parse(r.pdu)))
       : [clientEvent(member, row.eid)];
     const seq =
       full && membership === 'join'
@@ -185,7 +186,7 @@ async function renderRoom(home, server, user, r, conf, prior) {
   const oldest = initial || expanded ? floor : Math.max(floor, prior.seq + 1);
   const rows = home.sql
     .exec(
-      'SELECT seq,eid,pdu FROM room_client_events WHERE room=? AND seq>=? AND seq<=? ORDER BY seq DESC LIMIT ?',
+      'SELECT seq,eid,pdu,cause FROM room_visible_events WHERE room=? AND seq>=? AND seq<=? ORDER BY seq DESC LIMIT ?',
       r.id,
       oldest,
       r.seq,
@@ -195,7 +196,7 @@ async function renderRoom(home, server, user, r, conf, prior) {
   const limited = rows.length > conf.limit;
   if (limited) rows.pop();
   rows.reverse();
-  const timeline = rows.map((e) => clientEvent(JSON.parse(e.pdu), e.eid));
+  const timeline = rows.map((e) => clientEvent(JSON.parse(e.pdu), e.eid, e.cause));
   const senders = new Set(timeline.map((e) => e.sender));
   const required = r.state.filter((e) =>
     conf.state.some(

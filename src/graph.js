@@ -13,10 +13,12 @@ import { sign } from './federation.js';
 
 export const domain = (user) => /^@[^:]+:(.+)$/.exec(user)?.[1];
 export const eventId = (pdu, version = 10) => reference_id(JSON.stringify(pdu), version);
-export function clientEvent(pdu, id = eventId(pdu)) {
+export function clientEvent(pdu, id = eventId(pdu), redactionId) {
   const { sender, type, content, origin_server_ts, room_id, state_key } = pdu;
   return {
     event_id: id,
+    ...(type === 'm.room.redaction' && typeof (pdu.redacts ?? content.redacts) === 'string' && {redacts: pdu.redacts ?? content.redacts}),
+    ...(redactionId && {unsigned: {redacted_because: {event_id: redactionId, type: 'm.room.redaction'}}}),
     sender,
     type,
     content,
@@ -94,8 +96,10 @@ export class RoomGraph {
       ...(stateKey === undefined ? {} : { state_key: stateKey })
     };
   }
-  async local(identity, sender, type, content, stateKey) {
-    const pdu = await signPdu(identity, domain(sender), this.template(sender, type, content, stateKey),this.version);
+  async local(identity, sender, type, content, stateKey, redacts) {
+    const template = this.template(sender, type, content, stateKey);
+    if (redacts && this.version === 10) template.redacts = redacts;
+    const pdu = await signPdu(identity, domain(sender), template, this.version);
     this.add(pdu);
     return pdu;
   }

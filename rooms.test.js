@@ -173,6 +173,40 @@ for (const version of [10,11]) test(`private v${version} room checks invitations
   assert.deepEqual((await fedRoom(home,server,peer,'POST',['get_missing_events',room],new URLSearchParams(),afterFirst)).body.events,[]);
   await assert.rejects(fedRoom(home,server,'stranger.test','POST',['get_missing_events',room],new URLSearchParams(),gapRequest),/joined/);
 
+  // An authorized redaction reaches the client and the federated history endpoint
+  // for exactly one event. Reusing the transaction returns the same signed event.
+  const redact = (sender,id,tx) => roomClient(home,server,{user_id:sender,device_id:'web'},
+    'PUT',[room,'redact',id,tx],{reason:'Remove attachment'});
+  await assert.rejects(redact(other,one.body.event_id,'no'),e=>e.status===403);
+  const removal = (await redact(user,one.body.event_id,'remove')).body.event_id;
+  assert.equal((await redact(user,one.body.event_id,'remove')).body.event_id,removal);
+  const get = async id => (await roomClient(home,server,{user_id:user},'GET',[room,'event',id])).body;
+  assert.equal((await get(removal)).redacts,one.body.event_id);
+  assert.equal((await get(one.body.event_id)).unsigned.redacted_because.event_id,removal);
+  assert.deepEqual((await get(one.body.event_id)).content,{});
+  assert.equal((await get(tail.body.event_id)).content.body,'tip');
+  const fedRead = async id => (await fedRoom(home,server,peer,'GET',['event',room,id],new URLSearchParams())).body.pdus[0];
+  assert.deepEqual((await fedRead(one.body.event_id)).content,{});
+  const pdu = await fedRead(removal);
+  assert.equal(version === 10 ? pdu.redacts : pdu.content.redacts,one.body.event_id);
+  // A peer can send a valid redaction before its independently arriving target.
+  const pending = load(home,server,room);
+  const targetPdu = await signPdu(remote,peer,pending.template(other,'m.room.encrypted',{ciphertext:'file'}),version);
+  const targetId = eventId(targetPdu,version);
+  const pendingRedact = await pending.local(remote,other,'m.room.redaction',version === 11 ? {redacts:targetId} : {},undefined,targetId);
+  await receiveEvent(home,server,peer,pendingRedact);
+  await assert.rejects(get(eventId(pendingRedact,version)),e=>e.status===404);
+  await receiveEvent(home,server,peer,targetPdu);
+  assert.deepEqual((await get(targetId)).content,{});
+  assert.equal((await get(eventId(pendingRedact,version))).redacts,targetId);
+  const syncRedacted = (await roomSync(home,server,user,0,true)).rooms.join[room].timeline.events.find(e=>e.event_id===targetId);
+  assert.equal(syncRedacted.unsigned.redacted_because.event_id,eventId(pendingRedact,version));
+  const remoteDenied = await load(home,server,room).local(remote,other,'m.room.redaction',
+    version === 11 ? {redacts:tail.body.event_id} : {},undefined,tail.body.event_id);
+  await receiveEvent(home,server,peer,remoteDenied);
+  await assert.rejects(get(eventId(remoteDenied,version)),e=>e.status===404);
+  assert.equal((await get(tail.body.event_id)).content.body,'tip');
+
   const {recoverPredecessors} = await import('./src/gaps.js');
   const branch = load(home,server,room);
   const branchEvents=[];

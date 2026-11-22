@@ -4,6 +4,7 @@ import { canonical } from './identity.js';
 import { canReadEvent, disclosedEvent, saveAudience, missingEvents } from './history.js';
 import { acl_allows } from '../room-v10/pkg/relay_room_v10.js';
 import { verificationKeys } from './identity.js';
+import { indexExistingRedactions, mayModerate, projectedState, recordRedactions, redactionSchema, prunedEvent } from './redactions.js';
 import { StoredEvents } from './stored-events.js';
 import { graphKeys, keysForEvent } from './discovery.js';
 import { clientEvent, domain, eventId, RoomGraph } from './graph.js';
@@ -45,6 +46,8 @@ export function schema(sql) {
     CREATE TABLE IF NOT EXISTS federation_delivery_failures(peer TEXT PRIMARY KEY,events INTEGER NOT NULL,last_at INTEGER NOT NULL);
     CREATE TABLE IF NOT EXISTS retry(id TEXT PRIMARY KEY,attempt INTEGER NOT NULL,due INTEGER NOT NULL);
     CREATE TABLE IF NOT EXISTS user_data(seq INTEGER PRIMARY KEY AUTOINCREMENT,user TEXT,kind TEXT,content TEXT,UNIQUE(user,kind));`);
+  redactionSchema(sql);
+  indexExistingRedactions(sql);
 }
 export function roomVersion(sql, room) {
   return sql.exec('SELECT version FROM room_versions WHERE room=?', room).toArray()[0]?.version ?? 10;
@@ -101,6 +104,7 @@ export function save(home, g, pdus) {
     home.sql.exec('INSERT OR IGNORE INTO room_outliers VALUES(?,?,?,?)',g.room,id,-1,JSON.stringify(event));
     home.sql.exec('INSERT OR IGNORE INTO room_ancestry(room,eid) VALUES(?,?)',g.room,id);
   }
+  const received = [...(g.events?.pendingHistory ?? [])];
   let firstInserted;
   let lastInserted;
   for (const p of pdus) {
@@ -114,11 +118,13 @@ export function save(home, g, pdus) {
     if (row) {
       if (g.softFailed?.has(id))
         home.sql.exec('INSERT INTO room_soft_failures VALUES(?,?)',g.room,id);
+      else received.push([id,p]);
       saveAudience(home.sql,g,id,p);
       firstInserted ??= row.seq;
       lastInserted = row.seq;
     }
   }
+  recordRedactions(home.sql, g, received);
   home.sql.exec('DELETE FROM room_tips WHERE room=?', g.room);
   for (const tip of g.tips) home.sql.exec('INSERT INTO room_tips VALUES(?,?)', g.room, tip);
   if (g.unchangedState) return;
@@ -172,7 +178,7 @@ function commit(home, server, g, events, extra) {
       )
         continue;
       const state = [...g.state.values()]
-        .map((id) => g.events.get(id))
+        .map((id) => projectedState(home.sql, g.room, id, g.events.get(id)))
         .filter(
           (e) =>
             [
@@ -349,7 +355,7 @@ function messagePage(home, room, params, floor, ceiling) {
   if (!isObject(filter)) invalid('Invalid room filter');
   const rows = home.sql
     .exec(
-      'SELECT seq,eid,pdu FROM room_client_events WHERE room=? AND seq>=? AND seq<? ORDER BY seq ' +
+      'SELECT seq,eid,pdu,cause FROM room_visible_events WHERE room=? AND seq>=? AND seq<? ORDER BY seq ' +
         (backwards ? 'DESC' : 'ASC') + ' LIMIT 101',
       room,
       Math.max(floor, backwards ? to : from),
@@ -362,7 +368,7 @@ function messagePage(home, room, params, floor, ceiling) {
   for (const row of rows) {
     if (page.length >= Math.min(limit, 100) || (rows.length === 101 && row === rows[100])) { more = true; break; }
     last = row.seq;
-    const e = clientEvent(JSON.parse(row.pdu), row.eid);
+    const e = clientEvent(JSON.parse(row.pdu), row.eid, row.cause);
     if (!matchesRoomFilter(e, room, filter)) continue;
     page.push(e);
   }
@@ -375,10 +381,10 @@ function messagePage(home, room, params, floor, ceiling) {
 
 function eventLookup(home, server, room, action, id, params, floor, ceiling) {
   const target = home.sql.exec(
-    'SELECT seq,eid,pdu FROM room_client_events WHERE room=? AND eid=? AND seq>=? AND seq<?', room, id, floor, ceiling
+    'SELECT seq,eid,pdu,cause FROM room_visible_events WHERE room=? AND eid=? AND seq>=? AND seq<?', room, id, floor, ceiling
   ).toArray()[0];
   if (!target) missing();
-  const event = clientEvent(JSON.parse(target.pdu), target.eid);
+  const event = clientEvent(JSON.parse(target.pdu), target.eid, target.cause);
   if (action === 'event') return ok(event);
 
   const limit = Number(params.get('limit') ?? 10);
@@ -390,9 +396,9 @@ function eventLookup(home, server, room, action, id, params, floor, ceiling) {
     if (!size) return [];
     const direction = backwards ? 'seq<? ORDER BY seq DESC' : 'seq>? ORDER BY seq ASC';
     return home.sql.exec(
-      'SELECT seq,eid,pdu FROM room_client_events WHERE room=? AND seq>=? AND seq<? AND ' + direction + ' LIMIT ?',
+      'SELECT seq,eid,pdu,cause FROM room_visible_events WHERE room=? AND seq>=? AND seq<? AND ' + direction + ' LIMIT ?',
       room, floor, ceiling, target.seq, size
-    ).toArray().map(row => ({seq: row.seq, event: clientEvent(JSON.parse(row.pdu), row.eid)}))
+    ).toArray().map(row => ({seq: row.seq, event: clientEvent(JSON.parse(row.pdu), row.eid, row.cause)}))
       .filter(row => matchesRoomFilter(row.event, room, filter));
   };
   const before = surrounding(true, Math.floor(count / 2));
@@ -455,18 +461,18 @@ export async function roomClient(home, server, auth, method, parts, data, params
   if (method === 'GET' && action === 'state') {
     if (kind) {
       const e = g.get(kind, key ?? '');
-      return e ? ok(e.content) : missing();
+      return e ? ok(projectedState(home.sql, room, eventId(e,g.version), e).content) : missing();
     }
-    return ok([...g.state.values()].map((id) => clientEvent(g.events.get(id), id)));
+    return ok([...g.state.values()].map((id) => projectedState(home.sql, room, id, g.events.get(id))));
   }
   if (method === 'GET' && action === 'joined_members') {
-    const joined = Object.fromEntries(g.members('join').map(({state_key, content}) => [state_key, {
+    const joined = Object.fromEntries(g.members('join').map(e=>projectedState(home.sql, room, eventId(e,g.version), e)).map(({state_key, content}) => [state_key, {
       ...(typeof content.displayname === 'string' && {display_name: content.displayname}),
       ...(typeof content.avatar_url === 'string' && {avatar_url: content.avatar_url})
     }]));
     return ok({joined});
   }
-  if (method === 'GET' && action === 'members') return ok({ chunk: g.members().map((e) => clientEvent(e,eventId(e,g.version))) });
+  if (method === 'GET' && action === 'members') return ok({ chunk: g.members().map((e) => projectedState(home.sql, room, eventId(e,g.version), e)) });
   if (method !== 'GET') requireRoomAccess(g.get('m.room.server_acl'), server);
   let type,
     content = data,
@@ -478,23 +484,33 @@ export async function roomClient(home, server, auth, method, parts, data, params
     await openParty(home, server, stateKey);
     type = 'm.room.member';
     content = { membership: action, ...(action === 'join' && await home.profile?.(user,server)) };
-  } else if (method === 'PUT' && action === 'send' && kind && key) {
-    type = kind;
-    tx = JSON.stringify([user, auth.device_id, room, kind, key]);
+  } else if (method === 'PUT' && ['redact','send'].includes(action) && parts.length === 4 && kind && key) {
+    if (action === 'send' && kind === 'm.room.redaction') invalid('Use the redaction endpoint');
+    type = action === 'redact' ? 'm.room.redaction' : kind;
+    tx = action === 'redact' ? JSON.stringify([user, auth.device_id, room, action, kind, key])
+      : JSON.stringify([user, auth.device_id, room, kind, key]);
     const prior = home.sql.exec('SELECT eid FROM room_tx WHERE id=?', tx).toArray()[0];
     if (prior) return ok({ event_id: prior.eid });
+    if (action === 'redact') {
+      const target = g.events.get(kind);
+      if (!target || g.softFailed.has(kind)) missing();
+      if (user !== target.sender && !mayModerate([g.get('m.room.power_levels'),g.get('m.room.create')],user))
+        denied('Permission to redact this event is required');
+      if (!isObject(data) || (data.reason !== undefined && typeof data.reason !== 'string')) invalid('Invalid redaction reason');
+      content = {...(typeof data.reason === 'string' && {reason:data.reason}), ...(g.version === 11 && {redacts:kind})};
+    }
   } else if (
     method === 'PUT' &&
     action === 'state' &&
     kind &&
-    !['m.room.member', 'm.room.create'].includes(kind)
+    !['m.room.member', 'm.room.create','m.room.redaction'].includes(kind)
   ) {
     type = kind;
     stateKey = key ?? '';
   } else missing();
   if (!isObject(content)) invalid('Expected event content');
   const previous = action === 'state' && g.get(type, stateKey);
-  const event = await g.local(home.identity, user, type, content, stateKey),
+  const event = await g.local(home.identity, user, type, content, stateKey, action === 'redact' ? kind : undefined),
     id = eventId(event,g.version);
   if (previous?.sender === user && canonical(previous.content) === canonical(content))
     return ok({event_id: eventId(previous, g.version)});
@@ -502,7 +518,7 @@ export async function roomClient(home, server, auth, method, parts, data, params
     if (tx) home.sql.exec('INSERT INTO room_tx VALUES(?,?)', tx, id);
   });
   return ok(
-    action === 'join' ? { room_id: room } : action === 'send' || action === 'state' ? { event_id: id } : {}
+    action === 'join' ? { room_id: room } : ['send','redact','state'].includes(action) ? { event_id: id } : {}
   );
 }
 function authChain(graph,events) {
@@ -585,7 +601,14 @@ export async function fedRoom(home, server, peer, method, parts, params, body) {
     )
       invalid('Invalid join event');
     const prior = home.sql.exec('SELECT response FROM received WHERE id=?', cache).toArray()[0];
-    if (prior) return ok(JSON.parse(prior.response));
+    const forPeer = response => {
+      const visible = pdu => {
+        const pruned = prunedEvent(home.sql, room, eventId(pdu,g.version));
+        return pruned ? JSON.parse(pruned.pdu) : pdu;
+      };
+      return {...response, state:response.state.map(visible), auth_chain:response.auth_chain.map(visible)};
+    };
+    if (prior) return ok(forPeer(JSON.parse(prior.response)));
     const state = g.before(body.prev_events);
     const ids = authChain(g,state);
     const result = {
@@ -605,7 +628,7 @@ export async function fedRoom(home, server, peer, method, parts, params, body) {
     commit(home, server, g, [body], () =>
       home.sql.exec('INSERT INTO received VALUES(?,?)', cache, JSON.stringify(result))
     );
-    return ok(result);
+    return ok(forPeer(result));
   }
   missing();
 }
@@ -678,7 +701,7 @@ function stateBeforeStream(home, server, room, firstSeq) {
   ).toArray()[0];
   if (checkpoint && checkpoint.last_seq < firstSeq) {
     const store = new StoredEvents(home.sql, room);
-    return JSON.parse(checkpoint.state).map((id) => clientEvent(store.get(id), id));
+    return JSON.parse(checkpoint.state).map((id) => projectedState(home.sql, room, id, store.get(id)));
   }
   // Older rooms lack checkpoints. A sync may also start inside an imported multi-event batch.
   const prior = home.sql.exec('SELECT eid,pdu FROM room_events WHERE room=? AND seq<? ORDER BY seq', room, firstSeq).toArray();
@@ -686,11 +709,11 @@ function stateBeforeStream(home, server, room, firstSeq) {
   const store = new StoredEvents(home.sql, room);
   const base = store.joinBase();
   const original = base ?? store.joinBase(true);
-  if (original && !prior.length) return original.stateIds.map((id) => clientEvent(store.get(id),id));
+  if (original && !prior.length) return original.stateIds.map((id) => projectedState(home.sql, room, id, store.get(id)));
   const history = store.complete ? store.historyRows() : [];
   const prefix = new RoomGraph(room, keys, [...history,...prior], undefined, base,roomVersion(home.sql,room),
     softFailures(home.sql,room),new Set(history.map(row=>row.eid)));
-  return [...prefix.state.values()].map((id) => clientEvent(prefix.events.get(id) ?? store.get(id), id));
+  return [...prefix.state.values()].map((id) => projectedState(home.sql, room, id, prefix.events.get(id) ?? store.get(id)));
 }
 export async function roomSync(home, server, user, cursor, initial) {
   const high = home.sql.exec('SELECT COALESCE(MAX(seq),0) AS n FROM room_events').one().n;
@@ -707,7 +730,7 @@ export async function roomSync(home, server, user, cursor, initial) {
     if (membership === 'leave' || membership === 'ban') {
       if (!initial && home.sql.exec('SELECT 1 FROM room_client_events WHERE room=? AND eid=? AND seq>?',
         row.room, row.eid, cursor).toArray().length) {
-        rooms.leave[row.room] = { timeline: { events: [clientEvent(JSON.parse(row.pdu), row.eid)], limited: false }, state: { events: [] } };
+        rooms.leave[row.room] = { timeline: { events: [clientEvent(JSON.parse(row.pdu), row.eid, row.cause)], limited: false }, state: { events: [] } };
       }
       continue;
     }
@@ -720,7 +743,7 @@ export async function roomSync(home, server, user, cursor, initial) {
     const stateRows = home.sql
       .exec('SELECT s.eid,e.pdu FROM room_state s JOIN room_known_events e ON e.eid=s.eid WHERE s.room=?', row.room)
       .toArray();
-    const stateEvents = stateRows.map((r) => clientEvent(JSON.parse(r.pdu), r.eid));
+    const stateEvents = stateRows.map((r) => projectedState(home.sql, row.room, r.eid, JSON.parse(r.pdu)));
     const members = stateEvents.filter((e) => e.type === 'm.room.member');
     for (const m of members)
       if (['join', 'invite'].includes(m.content.membership)) await openParty(home, server, m.state_key);
@@ -756,7 +779,7 @@ export async function roomSync(home, server, user, cursor, initial) {
       const joinedNow = initial || sinceJoin > cursor;
       const rows = home.sql
         .exec(
-          'SELECT seq,pdu,eid FROM room_client_events WHERE room=? AND seq>=? ORDER BY seq DESC LIMIT 51',
+          'SELECT seq,pdu,eid,cause FROM room_visible_events WHERE room=? AND seq>=? ORDER BY seq DESC LIMIT 51',
           row.room,
           Math.max(sinceJoin, cursor + 1)
         )
@@ -764,7 +787,7 @@ export async function roomSync(home, server, user, cursor, initial) {
       const limited = rows.length > 50;
       if (limited) rows.pop();
       rows.reverse();
-      const events = rows.map((r) => clientEvent(JSON.parse(r.pdu), r.eid));
+      const events = rows.map((r) => clientEvent(JSON.parse(r.pdu), r.eid, r.cause));
       const state = (joinedNow || limited) && rows.length ? stateBeforeStream(home, server, row.room, rows[0].seq) : [];
       rooms.join[row.room] = {
         state: { events: state },
