@@ -2,7 +2,7 @@
 import { logoutSession, reconcileSessions, sessionSchema } from './device-sessions.js';
 import { dispatchPush, rulesFor } from './push.js';
 import { deliver, syncDevices } from './device.js';
-import { authorizeFile, visibleReceipts } from './cloud-references.js';
+import { authorizeFile, visibleReceipts, releaseReceipts } from './cloud-references.js';
 import { slidingPath, slidingSchema, slidingSync } from './sliding.js';
 import { approveOAuth, oauthOperation, oauthRoute, oauthSchema, oauthSession } from './oauth.js';
 import { exchange, rendezvousSchema, rendezvousRoute } from './rendezvous.js';
@@ -212,7 +212,8 @@ export class Homeserver extends DurableObject {
       .one().due;
     const profiles = sql.exec('SELECT MIN(due) AS due FROM profile_updates').one().due;
     const push = sql.exec('SELECT MIN(due) AS n FROM push_jobs').one().n;
-    const due = [next, profiles, push].filter((value) => value !== null);
+    const removals=this.env.CLOUD_MEDIA ? sql.exec('SELECT MIN(due) AS n FROM cloud_receipt_removals').one().n : null;
+    const due = [next, profiles, push, removals].filter((value) => value !== null);
     if (!due.length) return;
     const time = Math.max(Date.now() + 10, Math.min(...due));
     const scheduled = await this.ctx.storage.getAlarm();
@@ -266,6 +267,7 @@ export class Homeserver extends DurableObject {
   }
   async alarm() {
     await dispatchPush(this);
+    await releaseReceipts(this);
     for (const {server,user,room} of this.sql.exec('SELECT * FROM profile_updates WHERE due<=? LIMIT 8', Date.now()).toArray()) {
       try {
         await this.ctx.blockConcurrencyWhile(async () => {

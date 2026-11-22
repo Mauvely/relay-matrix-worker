@@ -438,7 +438,7 @@ test('leaving retains a bounded attachment history and forgetting removes it for
 });
 
 test('Cloud receipts belong to an account and one encrypted event, through leave, forget and redaction', async () => {
-  const {authorizeFile,visibleReceipts} = await import('./src/cloud-references.js');
+  const {authorizeFile,visibleReceipts,releaseReceipts} = await import('./src/cloud-references.js');
   const sql=memorySql(), server='worker.test', a='@alice:'+server, b='@bob:'+server;
   const ids=new Map([['mauvely-id/a',a],['mauvely-id/b',b]]);
   const home={sql,waiters:new Map(),identity:await createIdentity(),env:{},party:async()=>({organisationId:null}),
@@ -469,4 +469,20 @@ test('Cloud receipts belong to an account and one encrypted event, through leave
   await call(b,'POST',['forget']);
   assert.deepEqual(await visibleReceipts(home,server,'b',[first]),[]);
   assert.equal((await visibleReceipts(home,server,'a',[mine]))[0].mxc,mxc);
+  const delivered = [];
+  let online = false;
+  home.mediaAccount = async (destination, viewer) => destination === server && viewer === b ? 'b' : null;
+  home.env.CLOUD_MEDIA = { revokeReceipt: async (destination, account, id) => {
+    if (!online) throw Error('Cloud offline');
+    delivered.push({ destination, account, id });
+  } };
+  await releaseReceipts(home);
+  assert.equal(sql.exec('SELECT count(*) AS n FROM cloud_receipt_removals WHERE attempt=1 AND due>0').one().n,2);
+  online = true;
+  sql.exec('UPDATE cloud_receipt_removals SET due=0');
+  await releaseReceipts(home);
+  await releaseReceipts(home);
+  assert.deepEqual(delivered.map(d => d.id).sort(), [first,second].sort());
+  assert.ok(delivered.every(d => d.account==='b' && d.destination===server));
+  assert.equal(sql.exec('SELECT count(*) AS n FROM cloud_receipt_removals').one().n,0);
 });

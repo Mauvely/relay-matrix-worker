@@ -128,6 +128,10 @@ export async function mediaRoute(request, env, server, home, path, json) {
       if (!/^nod_[a-zA-Z0-9_-]{1,60}$/.test(spec?.nodeId) || !/^rev_[a-zA-Z0-9_-]{1,60}$/.test(spec?.revisionId)) {
         return json({errcode:'M_INVALID_PARAM',error:'Invalid revision'},400);
       }
+      if (spec.nodeId.startsWith('nod_mref_')) {
+        const mxc=await env.CLOUD_MEDIA.reuseRoomFile(server,payer,spec.nodeId,spec.revisionId);
+        return mxc ? json({content_uri:mxc}) : json({errcode:'M_NOT_FOUND',error:'Shared attachment unavailable'},404);
+      }
       const id = await env.CLOUD_MEDIA.publishRevision(server,payer,spec.nodeId,spec.revisionId);
       return id ? json({content_uri:'mxc://'+server+'/vault-'+id}) : json({errcode:'M_NOT_FOUND',error:'Cloud revision unavailable'},404);
     }
