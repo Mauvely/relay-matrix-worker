@@ -2,6 +2,7 @@
 import { logoutSession, reconcileSessions, sessionSchema } from './device-sessions.js';
 import { dispatchPush, rulesFor } from './push.js';
 import { deliver, syncDevices } from './device.js';
+import { authorizeFile, visibleReceipts } from './cloud-references.js';
 import { slidingPath, slidingSchema, slidingSync } from './sliding.js';
 import { approveOAuth, oauthOperation, oauthRoute, oauthSchema, oauthSession } from './oauth.js';
 import { exchange, rendezvousSchema, rendezvousRoute } from './rendezvous.js';
@@ -41,6 +42,27 @@ export class AccountDirectory extends WorkerEntrypoint {
     if (!endpoint || this.env.DOMAINS?.[endpoint] !== server || !(await delegated(server, endpoint, read)))
       throw Error('Account homeserver is not active');
     return this.env.HOMESERVERS.getByName(server).ensureAccount(server, accountId, localpart, organisationId, profile);
+  }
+}
+
+// Private Cloud binding. The public Matrix API never accepts a Mauvely account ID as authentication.
+export class CloudAttachmentDirectory extends WorkerEntrypoint {
+  #home(server) {
+    if (!server || server !== this.env.DOMAINS?.[this.env.ACCOUNT_ENDPOINT]) throw Error('Unknown Cloud homeserver');
+    return this.env.HOMESERVERS.getByName(server);
+  }
+  authorize(server,account,entry) { return this.#home(server).authorizeFile(server,account,entry); }
+  visible(server,account,ids) { return this.#home(server).visibleFiles(server,account,ids); }
+  async otherMedia(server,account,id) {
+    const home=this.#home(server);
+    const [entry]=await home.visibleFiles(server,account,[id]);
+    if (!entry) return null;
+    const [peer,media]=entry.mxc.slice(6).split('/');
+    if (peer===server) {
+      if (media.startsWith('cloud-') || media.startsWith('vault-')) return null;
+      return home.mediaRead(media);
+    }
+    return home.mediaRemote(server,peer,media);
   }
 }
 
@@ -196,6 +218,9 @@ export class Homeserver extends DurableObject {
     const scheduled = await this.ctx.storage.getAlarm();
     if (scheduled === null || scheduled > time) await this.ctx.storage.setAlarm(time);
   }
+  authorizeFile(server,account,entry) { return authorizeFile(this,server,account,entry); }
+  visibleFiles(server,account,ids) { return visibleReceipts(this,server,account,ids); }
+
   async mediaAccount(server, user) {
     if (!user.endsWith(':' + server)) throw Error('Wrong homeserver for upload');
     const account = await this.ctx.storage.get('account/' + user.slice(1, -server.length - 1));

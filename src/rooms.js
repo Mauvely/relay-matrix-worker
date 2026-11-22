@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
+import { referenceSchema } from './cloud-references.js';
 import { pushSchema, queuePush } from './push.js';
 import { canonical } from './identity.js';
 import { canReadEvent, disclosedEvent, saveAudience, missingEvents } from './history.js';
@@ -46,6 +47,7 @@ export function schema(sql) {
     CREATE TABLE IF NOT EXISTS federation_delivery_failures(peer TEXT PRIMARY KEY,events INTEGER NOT NULL,last_at INTEGER NOT NULL);
     CREATE TABLE IF NOT EXISTS retry(id TEXT PRIMARY KEY,attempt INTEGER NOT NULL,due INTEGER NOT NULL);
     CREATE TABLE IF NOT EXISTS user_data(seq INTEGER PRIMARY KEY AUTOINCREMENT,user TEXT,kind TEXT,content TEXT,UNIQUE(user,kind));`);
+  referenceSchema(sql);
   redactionSchema(sql);
   indexExistingRedactions(sql);
 }
@@ -94,7 +96,7 @@ export function requireRoomAccess(acl, server) {
   if (acl && !acl_allows(JSON.stringify(acl.content),server))
     denied('Server is denied by the room access control list');
 }
-async function checkParties(home, server, g) {
+export async function checkParties(home, server, g) {
   for (const e of g.members())
     if (['join', 'invite'].includes(e.content.membership)) await openParty(home, server, e.state_key);
 }
@@ -413,6 +415,29 @@ function eventLookup(home, server, room, action, id, params, floor, ceiling) {
   });
 }
 
+// Read the boundary from committed state in one synchronous turn. A graph loaded before
+// a policy lookup may already be stale by the time a room read or file receipt proceeds.
+export function historyWindow(home, room, user) {
+  const row = home.sql.exec(`SELECT s.eid,json_extract(e.pdu,'$.content.membership') AS membership
+    FROM room_state s JOIN room_known_events e ON e.room=s.room AND e.eid=s.eid
+    WHERE s.room=? AND s.kind='m.room.member' AND s.skey=?`,room,user).toArray()[0];
+  const left = ['leave','ban'].includes(row?.membership);
+  if (!left && row?.membership !== 'join') denied('Room membership required');
+  let ceiling;
+  if (left) {
+    if (home.sql.exec('SELECT 1 FROM room_forgets WHERE room=? AND user=? AND member_eid=?', room, user, row.eid).toArray().length)
+      denied('Room was forgotten');
+    const departure = home.sql.exec('SELECT seq FROM room_client_events WHERE room=? AND eid=?',room,row.eid).toArray()[0];
+    if (!departure) denied('No local departure record');
+    ceiling = departure.seq + 1;
+  } else {
+    ceiling = home.sql.exec('SELECT MAX(seq)+1 AS n FROM room_client_events WHERE room=?',room).one().n;
+  }
+  const floor = joinFloor(home,room,user,left ? ceiling-1 : ceiling);
+  if (floor === null) denied('No local room membership');
+  return {floor,ceiling};
+}
+
 export async function roomClient(home, server, auth, method, parts, data, params = new URLSearchParams()) {
   const [room, action, kind, key] = parts,
     user = auth.user_id;
@@ -426,25 +451,16 @@ export async function roomClient(home, server, auth, method, parts, data, params
   if (method === 'POST' && action === 'forget' && parts.length === 2) {
     if (!memberId) missing();
     if (!left) fail(400, 'M_UNKNOWN', 'Leave the room before forgetting it');
-    home.sql.exec('INSERT INTO room_forgets VALUES(?,?,?) ON CONFLICT(room,user) DO UPDATE SET member_eid=excluded.member_eid',
-      room, user, memberId);
+    home.ctx.storage.transactionSync(() => {
+      home.sql.exec('INSERT INTO room_forgets VALUES(?,?,?) ON CONFLICT(room,user) DO UPDATE SET member_eid=excluded.member_eid',
+        room, user, memberId);
+      home.sql.exec('DELETE FROM cloud_file_receipts WHERE room=? AND user=?',room,user);
+    });
     return ok();
   }
   const byId = ['event','context'].includes(action) && kind && parts.length === 3;
   if (method === 'GET' && (byId || (action === 'messages' && parts.length === 2))) {
-    if (!left && membership !== 'join') denied('Room membership required');
-    let ceiling;
-    if (left) {
-      if (home.sql.exec('SELECT 1 FROM room_forgets WHERE room=? AND user=? AND member_eid=?', room, user, memberId).toArray().length)
-        denied('Room was forgotten');
-      const departure = home.sql.exec('SELECT seq FROM room_client_events WHERE room=? AND eid=?', room, memberId).toArray()[0];
-      if (!departure) denied('No local departure record');
-      ceiling = departure.seq + 1;
-    } else {
-      ceiling = home.sql.exec('SELECT MAX(seq)+1 AS n FROM room_client_events WHERE room=?', room).one().n;
-    }
-    const floor = joinFloor(home, room, user, left ? ceiling - 1 : ceiling);
-    if (floor === null) denied('No local room membership');
+    const {floor,ceiling} = historyWindow(home,room,user);
     return byId ? eventLookup(home, server, room, action, kind, params, floor, ceiling)
       : messagePage(home, room, params, floor, ceiling);
   }

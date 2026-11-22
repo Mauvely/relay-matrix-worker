@@ -44,6 +44,7 @@ export function recordRedactions(sql, graph, entries) {
       if (!row.moderator && domain(row.sender) !== domain(original.sender)) continue;
       const pruned = redact_event(row.pdu, graph.version);
       sql.exec('INSERT OR IGNORE INTO room_pruned VALUES(?,?,?,?)', room, row.target, pruned, row.id);
+      sql.exec('DELETE FROM cloud_file_receipts WHERE room=? AND event=?',room,row.target);
       sql.exec('UPDATE room_redactions SET applied=1 WHERE room=? AND id=?', room, row.id);
     }
   }

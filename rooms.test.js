@@ -436,3 +436,37 @@ test('leaving retains a bounded attachment history and forgetting removes it for
   const fresh = await send('new');
   assert.equal((await request(guest,'GET',['event',fresh])).body.content.ciphertext,'new');
 });
+
+test('Cloud receipts belong to an account and one encrypted event, through leave, forget and redaction', async () => {
+  const {authorizeFile,visibleReceipts} = await import('./src/cloud-references.js');
+  const sql=memorySql(), server='worker.test', a='@alice:'+server, b='@bob:'+server;
+  const ids=new Map([['mauvely-id/a',a],['mauvely-id/b',b]]);
+  const home={sql,waiters:new Map(),identity:await createIdentity(),env:{},party:async()=>({organisationId:null}),
+    ctx:{storage:{transactionSync:f=>f(),get:key=>ids.get(key)}}};
+  schema(sql);
+  const {body:{room_id:room}}=await create(home,server,a,{invite:[b]});
+  const call=(user,method,path,data={})=>roomClient(home,server,{user_id:user},method,[room,...path],data);
+  const send=async tx=>(await call(a,'PUT',['send','m.room.encrypted',tx],{ciphertext:'fixture'})).body.event_id;
+  const mxc='mxc://worker.test/vault-fixture';
+  const grant=(account,viewer,event,source=mxc)=>authorizeFile(home,server,account,{viewer,room,event,mxc:source});
+  const before=await send('before');
+  await call(b,'POST',['join']);
+  assert.equal(await grant('b',b,before),null);
+  const one=await send('1'), two=await send('2');
+  const first=await grant('b',b,one), second=await grant('b',b,two), mine=await grant('a',a,one);
+  assert.ok(first && second && mine);
+  assert.equal(await grant('b',b,one),first);
+  assert.equal(await grant('a',b,one),null);
+  assert.equal(await grant('b',b,one,'mxc://other.example/different'),null);
+  assert.notEqual(first,second);
+  assert.deepEqual(await visibleReceipts(home,server,'a',[first]),[]);
+  await call(b,'POST',['leave']);
+  assert.equal((await visibleReceipts(home,server,'b',[first,second])).length,2);
+  assert.equal(await grant('b',b,await send('after')),null);
+  await call(a,'PUT',['redact',two,'remove']);
+  assert.deepEqual(await visibleReceipts(home,server,'b',[second]),[]);
+  assert.equal(await grant('b',b,two),null);
+  await call(b,'POST',['forget']);
+  assert.deepEqual(await visibleReceipts(home,server,'b',[first]),[]);
+  assert.equal((await visibleReceipts(home,server,'a',[mine]))[0].mxc,mxc);
+});
